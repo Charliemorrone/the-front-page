@@ -252,6 +252,88 @@ categories:
         ]
 
 
+def test_run_daily_folds_similar_titles_via_l3(temp_db, monkeypatch, tmp_path):
+    """End-to-end L3 check: a fetcher emits two items with different URLs
+    AND different content_hashes (so L1 and L2 both miss them) but
+    overlapping titles within the date window. The orchestrator's
+    filtering stage should produce ONE cluster via L3."""
+    from clawfeed_intel.fetchers import FetchedItem
+
+    yaml_body = """
+categories:
+  scratch:
+    sources:
+      - kind: rss
+        url: https://example.com/feed
+"""
+    _isolate_config(monkeypatch, tmp_path, yaml_body)
+
+    async def stub_fetcher(_conn, _task):
+        return [
+            FetchedItem(
+                source_type="rss",
+                dedup_key="outlet-a",
+                title="Anthropic raises Series F funding round",
+                url="https://outlet-a.example/anthropic",
+                canonical_url="https://outlet-a.example/anthropic",
+                content="Outlet A's writeup of the funding event.",
+                content_hash="hash-outlet-a",
+                published_at="2026-05-04T10:00:00+00:00",
+            ),
+            FetchedItem(
+                source_type="rss",
+                dedup_key="outlet-b",
+                title="Anthropic raises Series F funding round announcement",
+                url="https://outlet-b.example/anthropic",
+                canonical_url="https://outlet-b.example/anthropic",
+                content="Outlet B's distinct take on the same funding event.",
+                content_hash="hash-outlet-b",
+                published_at="2026-05-04T11:00:00+00:00",
+            ),
+            FetchedItem(
+                source_type="rss",
+                dedup_key="distinct",
+                title="Stock market closes higher today",
+                url="https://example.com/market",
+                canonical_url="https://example.com/market",
+                content="Unrelated market wrap.",
+                content_hash="hash-market",
+                published_at="2026-05-04T12:00:00+00:00",
+            ),
+        ]
+
+    monkeypatch.setattr(
+        "clawfeed_intel.fetchers.runner.FETCHER_REGISTRY",
+        {"rss": stub_fetcher},
+    )
+
+    with closing(worker_db.connect(temp_db)) as conn:
+        digest_id = run_daily("24h", conn=conn)
+
+        meta = json.loads(
+            conn.execute("SELECT metadata FROM digests WHERE id = ?", (digest_id,)).fetchone()[
+                "metadata"
+            ]
+        )
+        assert meta["coverage"]["raw_items"] == 3
+        assert meta["coverage"]["clusters"] == 2  # L3 folded the two Anthropic items
+
+        run_row = conn.execute(
+            "SELECT id FROM intel_runs WHERE digest_id = ?", (digest_id,)
+        ).fetchone()
+        cluster_keys = [
+            r["cluster_key"]
+            for r in conn.execute(
+                "SELECT cluster_key FROM item_clusters WHERE run_id = ? ORDER BY cluster_key",
+                (run_row["id"],),
+            ).fetchall()
+        ]
+        assert cluster_keys == [
+            "https://example.com/market",
+            "https://outlet-a.example/anthropic",  # smaller URL won the L3 merge
+        ]
+
+
 def test_run_daily_records_resolver_warning_in_coverage(temp_db, monkeypatch, tmp_path):
     """A missing config produces a PlanWarning that surfaces as
     coverage.plan_warnings — the brief should be able to explain why the

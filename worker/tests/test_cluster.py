@@ -20,6 +20,7 @@ from clawfeed_intel.pipeline.cluster import (
     cluster_by_canonical_url,
     cluster_run,
     fold_by_content_hash,
+    fold_by_event_similarity,
 )
 
 
@@ -494,6 +495,420 @@ def test_l2_idempotent_when_run_twice():
     assert once == twice
 
 
+def test_l2_propagates_earliest_published_at():
+    """When two drafts fold via shared content_hash, the merged
+    published_at is the earliest non-None — news propagates over time so
+    the earliest sighting is the best proxy for original publication."""
+    drafts = [
+        ClusterDraft(
+            cluster_key="https://b.example.com/x",
+            title="Late",
+            raw_item_ids=(5,),
+            representative_content_hash="h",
+            published_at="2026-05-04T18:00:00+00:00",
+        ),
+        ClusterDraft(
+            cluster_key="https://a.example.com/x",
+            title="Early",
+            raw_item_ids=(2,),
+            representative_content_hash="h",
+            published_at="2026-05-04T09:00:00+00:00",
+        ),
+    ]
+    folded = fold_by_content_hash(drafts)
+    assert len(folded) == 1
+    assert folded[0].published_at == "2026-05-04T09:00:00+00:00"
+
+
+# ── pure: fold_by_event_similarity (Level 3) ──────────────────────────────────
+
+
+def _draft(
+    cluster_key: str,
+    title: str,
+    rid: int,
+    *,
+    published_at: str | None = None,
+    rep_hash: str | None = None,
+) -> ClusterDraft:
+    return ClusterDraft(
+        cluster_key=cluster_key,
+        title=title,
+        raw_item_ids=(rid,),
+        representative_content_hash=rep_hash,
+        published_at=published_at,
+    )
+
+
+def test_l3_empty_input_returns_empty():
+    assert fold_by_event_similarity([]) == []
+
+
+def test_l3_single_draft_passes_through():
+    drafts = [_draft("https://x/a", "Anthropic raises Series F funding round", 1)]
+    assert fold_by_event_similarity(drafts) == drafts
+
+
+def test_l3_high_jaccard_titles_fold():
+    """Two outlets cover the same event with overlapping headlines —
+    Jaccard above the default 0.65 threshold → merge."""
+    drafts = [
+        _draft(
+            "https://outlet-a.example/anthropic",
+            "Anthropic raises Series F funding round",
+            1,
+            published_at="2026-05-04T10:00:00+00:00",
+        ),
+        _draft(
+            "https://outlet-b.example/anthropic",
+            "Anthropic raises Series F funding round today",
+            2,
+            published_at="2026-05-04T11:00:00+00:00",
+        ),
+    ]
+    folded = fold_by_event_similarity(drafts)
+    assert len(folded) == 1
+    assert folded[0].cluster_key == "https://outlet-a.example/anthropic"
+    assert folded[0].raw_item_ids == (1, 2)
+    assert folded[0].title == "Anthropic raises Series F funding round"
+    assert folded[0].published_at == "2026-05-04T10:00:00+00:00"
+
+
+def test_l3_low_jaccard_titles_stay_distinct():
+    drafts = [
+        _draft("https://x/a", "Apple announces new iPhone model", 1),
+        _draft("https://x/b", "Stock market closes higher today", 2),
+    ]
+    folded = fold_by_event_similarity(drafts)
+    assert len(folded) == 2
+
+
+def test_l3_short_titles_skip_l3():
+    """Titles below ``min_effective_tokens`` are too sparse for reliable
+    Jaccard — they pass through unchanged regardless of overlap."""
+    drafts = [
+        _draft("https://x/a", "Update", 1),
+        _draft("https://x/b", "Update", 2),
+    ]
+    folded = fold_by_event_similarity(drafts)
+    assert len(folded) == 2
+
+
+def test_l3_stopwords_and_boilerplate_dropped_from_tokens():
+    """Pure boilerplate ('BREAKING' / 'WATCH') doesn't contribute to
+    similarity. Two stories with only the prefix in common stay distinct."""
+    drafts = [
+        _draft("https://x/a", "BREAKING the New York mayor resigns suddenly", 1),
+        _draft("https://x/b", "BREAKING the Los Angeles mayor speaks at conference", 2),
+    ]
+    folded = fold_by_event_similarity(drafts)
+    assert len(folded) == 2
+
+
+def test_l3_numeric_mismatch_disqualifies_merge():
+    """Two funding stories with different amounts must not merge even if
+    every other token matches."""
+    drafts = [
+        _draft(
+            "https://x/a",
+            "Anthropic raises 500m Series F funding round",
+            1,
+            published_at="2026-05-04T10:00:00+00:00",
+        ),
+        _draft(
+            "https://x/b",
+            "Anthropic raises 1b Series G funding round",
+            2,
+            published_at="2026-05-04T11:00:00+00:00",
+        ),
+    ]
+    folded = fold_by_event_similarity(drafts)
+    assert len(folded) == 2
+
+
+def test_l3_overlapping_numeric_tokens_allow_merge():
+    drafts = [
+        _draft(
+            "https://x/a",
+            "Anthropic raises 1b Series F funding round",
+            1,
+            published_at="2026-05-04T10:00:00+00:00",
+        ),
+        _draft(
+            "https://x/b",
+            "Anthropic raises 1b Series F funding round announcement",
+            2,
+            published_at="2026-05-04T11:00:00+00:00",
+        ),
+    ]
+    folded = fold_by_event_similarity(drafts)
+    assert len(folded) == 1
+
+
+def test_l3_one_sided_numeric_does_not_disqualify():
+    """If only one title carries a number, the numeric guard can't judge —
+    fall back to title similarity."""
+    drafts = [
+        _draft(
+            "https://x/a",
+            "Anthropic releases new Claude 5 model variant",
+            1,
+            published_at="2026-05-04T10:00:00+00:00",
+        ),
+        _draft(
+            "https://x/b",
+            "Anthropic releases new Claude model variant publicly",
+            2,
+            published_at="2026-05-04T11:00:00+00:00",
+        ),
+    ]
+    folded = fold_by_event_similarity(drafts)
+    assert len(folded) == 1
+
+
+def test_l3_dates_outside_window_disqualify():
+    """Even with identical titles, drafts more than 48h apart describe
+    different events (e.g., the same headline used twice for different
+    quarterly earnings)."""
+    drafts = [
+        _draft(
+            "https://x/a",
+            "Apple announces quarterly earnings beat estimates",
+            1,
+            published_at="2026-05-01T10:00:00+00:00",
+        ),
+        _draft(
+            "https://x/b",
+            "Apple announces quarterly earnings beat estimates",
+            2,
+            published_at="2026-05-04T10:00:00+00:00",
+        ),
+    ]
+    folded = fold_by_event_similarity(drafts)
+    assert len(folded) == 2
+
+
+def test_l3_dates_inside_window_allow_merge():
+    drafts = [
+        _draft(
+            "https://x/a",
+            "Apple announces quarterly earnings beat estimates",
+            1,
+            published_at="2026-05-04T08:00:00+00:00",
+        ),
+        _draft(
+            "https://x/b",
+            "Apple announces quarterly earnings beat estimates",
+            2,
+            published_at="2026-05-05T18:00:00+00:00",
+        ),
+    ]
+    folded = fold_by_event_similarity(drafts)
+    assert len(folded) == 1
+
+
+def test_l3_missing_date_does_not_disqualify():
+    """A fetcher that omits published_at shouldn't lose L3 candidacy —
+    fall back to title similarity alone."""
+    drafts = [
+        _draft("https://x/a", "Anthropic raises Series F funding round", 1, published_at=None),
+        _draft(
+            "https://x/b",
+            "Anthropic raises Series F funding round announcement",
+            2,
+            published_at=None,
+        ),
+    ]
+    folded = fold_by_event_similarity(drafts)
+    assert len(folded) == 1
+
+
+def test_l3_unparseable_date_treated_as_missing():
+    drafts = [
+        _draft(
+            "https://x/a",
+            "Anthropic raises Series F funding round",
+            1,
+            published_at="not-a-date",
+        ),
+        _draft(
+            "https://x/b",
+            "Anthropic raises Series F funding round announcement",
+            2,
+            published_at="2026-05-04T10:00:00+00:00",
+        ),
+    ]
+    folded = fold_by_event_similarity(drafts)
+    assert len(folded) == 1
+
+
+def test_l3_naive_timestamp_treated_as_missing():
+    """tz-naive timestamps are an upstream inconsistency. Permissive: don't
+    disqualify on date when we can't compare cleanly."""
+    drafts = [
+        _draft(
+            "https://x/a",
+            "Anthropic raises Series F funding round",
+            1,
+            published_at="2026-05-04T10:00:00",
+        ),
+        _draft(
+            "https://x/b",
+            "Anthropic raises Series F funding round announcement",
+            2,
+            published_at="2026-05-04T10:00:00+00:00",
+        ),
+    ]
+    folded = fold_by_event_similarity(drafts)
+    assert len(folded) == 1
+
+
+def test_l3_transitive_merge_via_chain():
+    """A↔B and B↔C both qualify → A B C all merge into one cluster, even
+    if A and C alone would not have triggered a direct merge."""
+    drafts = [
+        _draft(
+            "https://x/a",
+            "OpenAI announces GPT 5 model release event today",
+            1,
+            published_at="2026-05-04T10:00:00+00:00",
+        ),
+        _draft(
+            "https://x/b",
+            "OpenAI announces GPT 5 model release event today live",
+            2,
+            published_at="2026-05-04T11:00:00+00:00",
+        ),
+        _draft(
+            "https://x/c",
+            "OpenAI announces GPT 5 model release event today live coverage",
+            3,
+            published_at="2026-05-04T12:00:00+00:00",
+        ),
+    ]
+    folded = fold_by_event_similarity(drafts)
+    assert len(folded) == 1
+    assert folded[0].raw_item_ids == (1, 2, 3)
+
+
+def test_l3_partial_fold_leaves_unrelated_drafts_alone():
+    drafts = [
+        _draft(
+            "https://x/a",
+            "Anthropic raises Series F funding round",
+            1,
+            published_at="2026-05-04T10:00:00+00:00",
+        ),
+        _draft(
+            "https://x/b",
+            "Anthropic raises Series F funding round announcement",
+            2,
+            published_at="2026-05-04T11:00:00+00:00",
+        ),
+        _draft(
+            "https://x/c",
+            "Stock market closes higher today",
+            3,
+            published_at="2026-05-04T12:00:00+00:00",
+        ),
+    ]
+    folded = fold_by_event_similarity(drafts)
+    assert len(folded) == 2
+    keys = sorted(d.cluster_key for d in folded)
+    assert keys == ["https://x/a", "https://x/c"]
+    a_draft = next(d for d in folded if d.cluster_key == "https://x/a")
+    assert a_draft.raw_item_ids == (1, 2)
+
+
+def test_l3_idempotent_on_repeat():
+    drafts = [
+        _draft(
+            "https://x/a",
+            "Anthropic raises Series F funding round",
+            1,
+            published_at="2026-05-04T10:00:00+00:00",
+        ),
+        _draft(
+            "https://x/b",
+            "Anthropic raises Series F funding round announcement",
+            2,
+            published_at="2026-05-04T11:00:00+00:00",
+        ),
+    ]
+    once = fold_by_event_similarity(drafts)
+    twice = fold_by_event_similarity(once)
+    assert once == twice
+
+
+def test_l3_input_order_independent():
+    """Two different input orderings of the same drafts produce the same
+    folded output. Critical for re-runs and concurrent fetches that may
+    reorder rows."""
+    a = _draft(
+        "https://x/a",
+        "Anthropic raises Series F funding round",
+        1,
+        published_at="2026-05-04T10:00:00+00:00",
+    )
+    b = _draft(
+        "https://x/b",
+        "Anthropic raises Series F funding round announcement",
+        2,
+        published_at="2026-05-04T11:00:00+00:00",
+    )
+    c = _draft(
+        "https://x/c",
+        "Stock market closes higher today",
+        3,
+        published_at="2026-05-04T12:00:00+00:00",
+    )
+    forward = fold_by_event_similarity([a, b, c])
+    reverse = fold_by_event_similarity([c, b, a])
+    assert forward == reverse
+
+
+def test_l3_merged_cluster_key_is_lex_smallest():
+    drafts = [
+        _draft(
+            "https://yahoo.example/anthropic",
+            "Anthropic raises Series F funding round",
+            5,
+            published_at="2026-05-04T10:00:00+00:00",
+        ),
+        _draft(
+            "https://abc.example/anthropic",
+            "Anthropic raises Series F funding round announcement",
+            2,
+            published_at="2026-05-04T11:00:00+00:00",
+        ),
+    ]
+    folded = fold_by_event_similarity(drafts)
+    assert folded[0].cluster_key == "https://abc.example/anthropic"
+
+
+def test_l3_threshold_can_be_tightened():
+    """Same data, higher threshold → no merge. Confirms the parameter is
+    actually load-bearing and tunable."""
+    drafts = [
+        _draft(
+            "https://x/a",
+            "Anthropic raises Series F funding round",
+            1,
+            published_at="2026-05-04T10:00:00+00:00",
+        ),
+        _draft(
+            "https://x/b",
+            "Anthropic raises Series F funding round announcement deal",
+            2,
+            published_at="2026-05-04T11:00:00+00:00",
+        ),
+    ]
+    permissive = fold_by_event_similarity(drafts, title_threshold=0.5)
+    strict = fold_by_event_similarity(drafts, title_threshold=0.95)
+    assert len(permissive) == 1
+    assert len(strict) == 2
+
+
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
 
@@ -516,6 +931,7 @@ def _seed_item(
     source_type: str = "rss",
     content: str = "",
     content_hash: str | None = None,
+    published_at: str | None = None,
 ) -> int:
     raw_item_id, _ = worker_db.upsert_raw_item(
         conn,
@@ -527,6 +943,7 @@ def _seed_item(
         canonical_url=canonical_url,
         content=content,
         content_hash_value=content_hash,
+        published_at=published_at,
     )
     return raw_item_id
 
@@ -1119,3 +1536,275 @@ def test_cluster_run_l2_idempotent_on_repeat(temp_db):
             (run_id,),
         ).fetchone()["n"]
         assert member_count == 2
+
+
+# ── orchestration: L3 (heuristic event similarity) end-to-end ────────────────
+
+
+def test_cluster_run_folds_similar_titles_via_l3(temp_db):
+    """Two stories about the same event written up by different outlets —
+    different URLs, different bodies (so L1 and L2 both miss them), but
+    titles overlap heavily and dates are within window. L3 should fold."""
+    with closing(worker_db.connect(temp_db)) as conn:
+        run_id = _make_run(conn)
+        _seed_item(
+            conn,
+            run_id,
+            dedup_key="rss/anthropic",
+            canonical_url="https://outlet-a.example/anthropic-funding",
+            title="Anthropic raises Series F funding round",
+            content="rss body",
+            content_hash="hash-rss",
+            published_at="2026-05-04T10:00:00+00:00",
+        )
+        _seed_item(
+            conn,
+            run_id,
+            dedup_key="hn/anthropic",
+            canonical_url="https://outlet-b.example/anthropic-funding",
+            title="Anthropic raises Series F funding round announcement",
+            source_type="hn",
+            content="hn body",
+            content_hash="hash-hn",
+            published_at="2026-05-04T11:00:00+00:00",
+        )
+        assert cluster_run(conn, run_id) == 1
+
+        cluster = conn.execute(
+            "SELECT cluster_key, title FROM item_clusters WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        assert cluster["cluster_key"] == "https://outlet-a.example/anthropic-funding"
+        assert cluster["title"] == "Anthropic raises Series F funding round"
+
+
+def test_cluster_run_l3_preserves_distinct_funding_amounts(temp_db):
+    """Two funding stories with different amounts must NOT collapse —
+    L3's numeric guard is the safety net here."""
+    with closing(worker_db.connect(temp_db)) as conn:
+        run_id = _make_run(conn)
+        _seed_item(
+            conn,
+            run_id,
+            dedup_key="a",
+            canonical_url="https://a.example/anthropic-1",
+            title="Anthropic raises 500m Series F funding round",
+            content_hash="ha",
+            published_at="2026-05-04T10:00:00+00:00",
+        )
+        _seed_item(
+            conn,
+            run_id,
+            dedup_key="b",
+            canonical_url="https://b.example/anthropic-2",
+            title="Anthropic raises 1b Series G funding round",
+            content_hash="hb",
+            published_at="2026-05-04T11:00:00+00:00",
+        )
+        assert cluster_run(conn, run_id) == 2
+
+
+def test_cluster_run_l3_respects_date_window(temp_db):
+    """Identical headlines on dates outside the L3 window stay distinct —
+    the same headline used twice for two quarterly events shouldn't
+    collapse into one cluster."""
+    with closing(worker_db.connect(temp_db)) as conn:
+        run_id = _make_run(conn)
+        _seed_item(
+            conn,
+            run_id,
+            dedup_key="a",
+            canonical_url="https://a.example/q1",
+            title="Apple announces quarterly earnings beat estimates",
+            content_hash="ha",
+            published_at="2026-02-01T10:00:00+00:00",
+        )
+        _seed_item(
+            conn,
+            run_id,
+            dedup_key="b",
+            canonical_url="https://b.example/q2",
+            title="Apple announces quarterly earnings beat estimates",
+            content_hash="hb",
+            published_at="2026-05-01T10:00:00+00:00",
+        )
+        assert cluster_run(conn, run_id) == 2
+
+
+def test_cluster_run_chains_l1_l2_and_l3_independently(temp_db):
+    """Mixed scenario exercising all three levels in one run:
+
+    - Two items at the same canonical URL (L1 collapse).
+    - Two items at different URLs but with the same content_hash (L2 fold).
+    - Two items at different URLs, different content_hashes, but similar
+      titles within the date window (L3 fold).
+    - One standalone.
+
+    Expected: 4 final clusters."""
+    with closing(worker_db.connect(temp_db)) as conn:
+        run_id = _make_run(conn)
+        # L1 group.
+        _seed_item(
+            conn,
+            run_id,
+            dedup_key="rss/x",
+            canonical_url="https://example.com/x",
+            title="Event X happened today",
+            content_hash="hash-x",
+            published_at="2026-05-04T08:00:00+00:00",
+        )
+        _seed_item(
+            conn,
+            run_id,
+            dedup_key="hn/x",
+            canonical_url="https://example.com/x",
+            title="Event X happened today (HN)",
+            source_type="hn",
+            content_hash="hash-x",
+            published_at="2026-05-04T08:30:00+00:00",
+        )
+        # L2 group.
+        _seed_item(
+            conn,
+            run_id,
+            dedup_key="orig/y",
+            canonical_url="https://news-a.example/y",
+            title="Event Y syndicated copy",
+            content_hash="hash-syn",
+            published_at="2026-05-04T09:00:00+00:00",
+        )
+        _seed_item(
+            conn,
+            run_id,
+            dedup_key="syn/y",
+            canonical_url="https://news-b.example/y",
+            title="Event Y syndicated copy",
+            source_type="gdelt",
+            content_hash="hash-syn",
+            published_at="2026-05-04T09:30:00+00:00",
+        )
+        # L3 group.
+        _seed_item(
+            conn,
+            run_id,
+            dedup_key="z-rss",
+            canonical_url="https://outlet-1.example/zeta-funding",
+            title="Zeta startup raises Series A funding round",
+            content_hash="hash-z1",
+            published_at="2026-05-04T10:00:00+00:00",
+        )
+        _seed_item(
+            conn,
+            run_id,
+            dedup_key="z-hn",
+            canonical_url="https://outlet-2.example/zeta-funding",
+            title="Zeta startup raises Series A funding round announcement",
+            source_type="hn",
+            content_hash="hash-z2",
+            published_at="2026-05-04T11:00:00+00:00",
+        )
+        # Standalone.
+        _seed_item(
+            conn,
+            run_id,
+            dedup_key="standalone",
+            canonical_url="https://example.com/unrelated",
+            title="Stock market closes higher today",
+            content_hash="hash-unrelated",
+            published_at="2026-05-04T12:00:00+00:00",
+        )
+
+        assert cluster_run(conn, run_id) == 4
+
+        sizes = conn.execute(
+            """
+            SELECT c.cluster_key, COUNT(ci.raw_item_id) AS n_members
+              FROM item_clusters c
+              JOIN cluster_items ci ON ci.cluster_id = c.id
+             WHERE c.run_id = ?
+             GROUP BY c.id
+             ORDER BY c.cluster_key
+            """,
+            (run_id,),
+        ).fetchall()
+        size_by_key = {r["cluster_key"]: r["n_members"] for r in sizes}
+        assert size_by_key == {
+            "https://example.com/x": 2,
+            "https://news-a.example/y": 2,
+            "https://outlet-1.example/zeta-funding": 2,
+            "https://example.com/unrelated": 1,
+        }
+
+
+def test_cluster_run_l3_idempotent_on_repeat(temp_db):
+    """Re-running cluster_run after L3 has folded a similar pair must not
+    duplicate clusters or relink members."""
+    with closing(worker_db.connect(temp_db)) as conn:
+        run_id = _make_run(conn)
+        _seed_item(
+            conn,
+            run_id,
+            dedup_key="a",
+            canonical_url="https://a.example/anthropic",
+            title="Anthropic raises Series F funding round",
+            content_hash="ha",
+            published_at="2026-05-04T10:00:00+00:00",
+        )
+        _seed_item(
+            conn,
+            run_id,
+            dedup_key="b",
+            canonical_url="https://b.example/anthropic",
+            title="Anthropic raises Series F funding round announcement",
+            content_hash="hb",
+            published_at="2026-05-04T11:00:00+00:00",
+        )
+        first = cluster_run(conn, run_id)
+        second = cluster_run(conn, run_id)
+        assert first == second == 1
+
+        cluster_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM item_clusters WHERE run_id = ?", (run_id,)
+        ).fetchone()["n"]
+        assert cluster_count == 1
+        member_count = conn.execute(
+            """
+            SELECT COUNT(*) AS n FROM cluster_items ci
+              JOIN item_clusters c ON c.id = ci.cluster_id
+             WHERE c.run_id = ?
+            """,
+            (run_id,),
+        ).fetchone()["n"]
+        assert member_count == 2
+
+
+def test_cluster_run_l3_does_not_cross_into_l1_dup_keys(temp_db):
+    """Sanity: with two L1 drafts that L3 would have folded, the persisted
+    cluster_key uses the SMALLER URL — not whichever happened to fold
+    second. Stable across re-runs."""
+    with closing(worker_db.connect(temp_db)) as conn:
+        run_id = _make_run(conn)
+        _seed_item(
+            conn,
+            run_id,
+            dedup_key="zz",
+            canonical_url="https://zz.example/anthropic",
+            title="Anthropic raises Series F funding round",
+            content_hash="hzz",
+            published_at="2026-05-04T10:00:00+00:00",
+        )
+        _seed_item(
+            conn,
+            run_id,
+            dedup_key="aa",
+            canonical_url="https://aa.example/anthropic",
+            title="Anthropic raises Series F funding round announcement",
+            content_hash="haa",
+            published_at="2026-05-04T11:00:00+00:00",
+        )
+        cluster_run(conn, run_id)
+        cluster = conn.execute(
+            "SELECT cluster_key FROM item_clusters WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        assert cluster["cluster_key"] == "https://aa.example/anthropic"
