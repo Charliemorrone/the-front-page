@@ -23,6 +23,7 @@ from .runner import run_fetch_stage
 from . import arxiv as _arxiv  # noqa: F401  registers kind="arxiv"
 from . import gdelt as _gdelt  # noqa: F401  registers kind="gdelt"
 from . import hn as _hn  # noqa: F401  registers kind="hn"
+from . import reddit as _reddit  # noqa: F401  registers kind="reddit"
 from . import rss as _rss  # noqa: F401  registers kind="rss"
 from . import sec as _sec  # noqa: F401  registers kind="sec_edgar"
 
