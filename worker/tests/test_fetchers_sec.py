@@ -268,7 +268,7 @@ def test_dedup_key_is_accession_not_url():
 # ── fetch_sec with MockTransport ──────────────────────────────────────────────
 
 
-async def test_fetch_builds_per_form_query_urls(patch_client):
+async def test_fetch_builds_per_form_query_urls(patch_client, conn):
     captured: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -281,7 +281,7 @@ async def test_fetch_builds_per_form_query_urls(patch_client):
         return httpx.Response(404)
 
     patch_client(handler)
-    items = await fetch_sec(_task(forms=["D", "D/A"]))
+    items = await fetch_sec(conn, _task(forms=["D", "D/A"]))
 
     # Two requests, one per form
     assert len(captured) == 2
@@ -305,17 +305,17 @@ async def test_fetch_builds_per_form_query_urls(patch_client):
     ]
 
 
-async def test_fetch_records_query_url_in_metadata(patch_client):
+async def test_fetch_records_query_url_in_metadata(patch_client, conn):
     def handler(_request):
         return httpx.Response(200, text=D_FIXTURE)
 
     patch_client(handler)
-    items = await fetch_sec(_task(forms=["D"]))
+    items = await fetch_sec(conn, _task(forms=["D"]))
     for item in items:
         assert API_URL in item.metadata.get("query_url", "")
 
 
-async def test_fetch_partial_failure_returns_other_form_results(patch_client):
+async def test_fetch_partial_failure_returns_other_form_results(patch_client, conn):
     """One form 5xx → other form's items still returned; task is 'succeeded'."""
 
     def handler(request):
@@ -327,7 +327,7 @@ async def test_fetch_partial_failure_returns_other_form_results(patch_client):
         return httpx.Response(404)
 
     patch_client(handler)
-    items = await fetch_sec(_task(forms=["D", "D/A"]))
+    items = await fetch_sec(conn, _task(forms=["D", "D/A"]))
 
     # Only the D fixture's items survive; partial degradation, not failure.
     assert {i.dedup_key for i in items} == {
@@ -336,7 +336,7 @@ async def test_fetch_partial_failure_returns_other_form_results(patch_client):
     }
 
 
-async def test_fetch_total_failure_propagates(patch_client):
+async def test_fetch_total_failure_propagates(patch_client, conn):
     """All forms fail → re-raise so the runner records the task as failed."""
 
     def handler(_request):
@@ -344,10 +344,10 @@ async def test_fetch_total_failure_propagates(patch_client):
 
     patch_client(handler)
     with pytest.raises(httpx.HTTPStatusError):
-        await fetch_sec(_task(forms=["D", "D/A"]))
+        await fetch_sec(conn, _task(forms=["D", "D/A"]))
 
 
-async def test_fetch_records_ua_with_contact(patch_client):
+async def test_fetch_records_ua_with_contact(patch_client, conn):
     """SEC explicitly requires a contact-bearing UA. Verify it's set."""
     captured: dict = {}
 
@@ -356,12 +356,12 @@ async def test_fetch_records_ua_with_contact(patch_client):
         return httpx.Response(200, text=D_FIXTURE)
 
     patch_client(handler)
-    await fetch_sec(_task(forms=["D"]))
+    await fetch_sec(conn, _task(forms=["D"]))
     assert "ClawFeed-Intel" in (captured["ua"] or "")
     assert "+contact:" in (captured["ua"] or "")
 
 
-async def test_fetch_rejects_non_sec_task():
+async def test_fetch_rejects_non_sec_task(conn):
     from clawfeed_intel.sources import RssTask
 
     bad = ResolvedTask(
@@ -372,7 +372,7 @@ async def test_fetch_rejects_non_sec_task():
         source_name="x",
     )
     with pytest.raises(TypeError, match="expected SecEdgarTask"):
-        await fetch_sec(bad)
+        await fetch_sec(conn, bad)
 
 
 # ── registration ──────────────────────────────────────────────────────────────

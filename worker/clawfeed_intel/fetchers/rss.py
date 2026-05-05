@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
@@ -50,8 +51,13 @@ EXCERPT_CHARS = 320
 MAX_ARTICLE_BYTES = 2 * 1024 * 1024
 
 
-async def fetch_rss(task: ResolvedTask) -> list[FetchedItem]:
-    """Fetch one RSS or Atom feed and return normalized items."""
+async def fetch_rss(conn: sqlite3.Connection, task: ResolvedTask) -> list[FetchedItem]:
+    """Fetch one RSS or Atom feed and return normalized items.
+
+    ``conn`` is part of the unified fetcher contract; this fetcher does not
+    touch the database (only GitHub does).
+    """
+    del conn
     if not isinstance(task.task, RssTask):
         raise TypeError(f"fetch_rss expected RssTask, got {type(task.task).__name__}")
 

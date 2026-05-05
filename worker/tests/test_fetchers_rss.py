@@ -206,7 +206,7 @@ def test_published_falls_back_to_updated_when_no_published():
 # ── fetch_rss with MockTransport ──────────────────────────────────────────────
 
 
-async def test_fetch_rss_returns_items_via_mock_transport(patch_client, monkeypatch):
+async def test_fetch_rss_returns_items_via_mock_transport(patch_client, monkeypatch, conn):
     """Both fixture entries have thin summaries, so the trafilatura fallback
     would otherwise fire — patch it out so this test is focused on the feed
     HTTP path. The fallback has its own dedicated tests below."""
@@ -226,7 +226,7 @@ async def test_fetch_rss_returns_items_via_mock_transport(patch_client, monkeypa
         )
 
     patch_client(handler)
-    items = await fetch_rss(_task())
+    items = await fetch_rss(conn, _task())
 
     assert len(items) == 2
     assert "ClawFeed-Intel" in (captured.get("ua") or "")
@@ -234,7 +234,7 @@ async def test_fetch_rss_returns_items_via_mock_transport(patch_client, monkeypa
     assert captured["urls"][0] == "https://example.com/feed"
 
 
-async def test_fetch_rss_raises_on_http_error(patch_client):
+async def test_fetch_rss_raises_on_http_error(patch_client, conn):
     """5xx must raise so the runner records a 'failed' outcome."""
 
     def handler(_request):
@@ -242,19 +242,19 @@ async def test_fetch_rss_raises_on_http_error(patch_client):
 
     patch_client(handler)
     with pytest.raises(httpx.HTTPStatusError):
-        await fetch_rss(_task())
+        await fetch_rss(conn, _task())
 
 
-async def test_fetch_rss_raises_on_404(patch_client):
+async def test_fetch_rss_raises_on_404(patch_client, conn):
     def handler(_request):
         return httpx.Response(404, text="not found")
 
     patch_client(handler)
     with pytest.raises(httpx.HTTPStatusError):
-        await fetch_rss(_task())
+        await fetch_rss(conn, _task())
 
 
-async def test_fetch_rss_rejects_non_rss_task():
+async def test_fetch_rss_rejects_non_rss_task(conn):
     from clawfeed_intel.sources import GdeltTask
 
     bad_task = ResolvedTask(
@@ -265,7 +265,7 @@ async def test_fetch_rss_rejects_non_rss_task():
         source_name="x",
     )
     with pytest.raises(TypeError, match="expected RssTask"):
-        await fetch_rss(bad_task)
+        await fetch_rss(conn, bad_task)
 
 
 # ── trafilatura fallback ──────────────────────────────────────────────────────
@@ -288,7 +288,7 @@ LONG_FEED = (
 )
 
 
-async def test_trafilatura_fallback_replaces_thin_summary(patch_client, monkeypatch):
+async def test_trafilatura_fallback_replaces_thin_summary(patch_client, monkeypatch, conn):
     def handler(_request):
         return httpx.Response(200, text=THIN_FEED)
 
@@ -301,7 +301,7 @@ async def test_trafilatura_fallback_replaces_thin_summary(patch_client, monkeypa
 
     monkeypatch.setattr(rss_mod, "_trafilatura_extract", fake_extract)
 
-    items = await fetch_rss(_task("https://x.example/feed"))
+    items = await fetch_rss(conn, _task("https://x.example/feed"))
     assert len(items) == 1
     item = items[0]
     assert item.content == full_text
@@ -311,7 +311,7 @@ async def test_trafilatura_fallback_replaces_thin_summary(patch_client, monkeypa
     assert item.excerpt == full_text[: rss_mod.EXCERPT_CHARS]
 
 
-async def test_trafilatura_skipped_when_summary_long_enough(patch_client, monkeypatch):
+async def test_trafilatura_skipped_when_summary_long_enough(patch_client, monkeypatch, conn):
     def handler(_request):
         return httpx.Response(200, text=LONG_FEED)
 
@@ -324,14 +324,14 @@ async def test_trafilatura_skipped_when_summary_long_enough(patch_client, monkey
         return "should not be used"
 
     monkeypatch.setattr(rss_mod, "_trafilatura_extract", fake_extract)
-    items = await fetch_rss(_task("https://x.example/feed"))
+    items = await fetch_rss(conn, _task("https://x.example/feed"))
 
     assert len(items) == 1
     assert items[0].metadata.get("trafilatura") is None
     assert called["n"] == 0
 
 
-async def test_trafilatura_failure_falls_back_to_summary(patch_client, monkeypatch):
+async def test_trafilatura_failure_falls_back_to_summary(patch_client, monkeypatch, conn):
     """A failed extraction must not abort the run; we keep the original summary."""
 
     def handler(_request):
@@ -343,7 +343,7 @@ async def test_trafilatura_failure_falls_back_to_summary(patch_client, monkeypat
         return None  # extractor failed / page was non-extractable
 
     monkeypatch.setattr(rss_mod, "_trafilatura_extract", fake_extract)
-    items = await fetch_rss(_task("https://x.example/feed"))
+    items = await fetch_rss(conn, _task("https://x.example/feed"))
 
     assert len(items) == 1
     assert items[0].content == "tiny."

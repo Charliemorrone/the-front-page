@@ -268,7 +268,7 @@ def test_dedup_key_is_arxiv_id_not_canonical_url():
 # ── fetch_arxiv with MockTransport ────────────────────────────────────────────
 
 
-async def test_fetch_arxiv_builds_query_url(patch_client):
+async def test_fetch_arxiv_builds_query_url(patch_client, conn):
     captured: dict = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -277,7 +277,7 @@ async def test_fetch_arxiv_builds_query_url(patch_client):
         return httpx.Response(200, text=ATOM_FIXTURE)
 
     patch_client(handler)
-    items = await fetch_arxiv(_task(["cs.AI", "cs.LG"]))
+    items = await fetch_arxiv(conn, _task(["cs.AI", "cs.LG"]))
     assert len(items) == 2
 
     parts = urlsplit(captured["url"])
@@ -296,7 +296,7 @@ async def test_fetch_arxiv_builds_query_url(patch_client):
     assert "+contact:" in (captured["ua"] or "")
 
 
-async def test_fetch_arxiv_single_category_query(patch_client):
+async def test_fetch_arxiv_single_category_query(patch_client, conn):
     captured: dict = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -304,25 +304,25 @@ async def test_fetch_arxiv_single_category_query(patch_client):
         return httpx.Response(200, text=ATOM_FIXTURE)
 
     patch_client(handler)
-    await fetch_arxiv(_task(["cs.AI"]))
+    await fetch_arxiv(conn, _task(["cs.AI"]))
 
     parts = urlsplit(captured["url"])
     qs = parse_qs(parts.query)
     assert qs["search_query"] == ["cat:cs.AI"]
 
 
-async def test_fetch_arxiv_records_query_url_in_metadata(patch_client):
+async def test_fetch_arxiv_records_query_url_in_metadata(patch_client, conn):
     def handler(_request):
         return httpx.Response(200, text=ATOM_FIXTURE)
 
     patch_client(handler)
-    items = await fetch_arxiv(_task(["cs.AI"]))
+    items = await fetch_arxiv(conn, _task(["cs.AI"]))
     for item in items:
         assert "query_url" in item.metadata
         assert "search_query=cat" in item.metadata["query_url"]
 
 
-async def test_fetch_arxiv_raises_on_5xx(patch_client):
+async def test_fetch_arxiv_raises_on_5xx(patch_client, conn):
     """Upstream errors must propagate so the runner records 'failed'."""
 
     def handler(_request):
@@ -330,10 +330,10 @@ async def test_fetch_arxiv_raises_on_5xx(patch_client):
 
     patch_client(handler)
     with pytest.raises(httpx.HTTPStatusError):
-        await fetch_arxiv(_task())
+        await fetch_arxiv(conn, _task())
 
 
-async def test_fetch_arxiv_rejects_non_arxiv_task():
+async def test_fetch_arxiv_rejects_non_arxiv_task(conn):
     from clawfeed_intel.sources import RssTask
 
     bad_task = ResolvedTask(
@@ -344,7 +344,7 @@ async def test_fetch_arxiv_rejects_non_arxiv_task():
         source_name="x",
     )
     with pytest.raises(TypeError, match="expected ArxivTask"):
-        await fetch_arxiv(bad_task)
+        await fetch_arxiv(conn, bad_task)
 
 
 # ── registration ──────────────────────────────────────────────────────────────

@@ -22,6 +22,7 @@ from .runner import run_fetch_stage
 # Add new fetchers here as their steps land.
 from . import arxiv as _arxiv  # noqa: F401  registers kind="arxiv"
 from . import gdelt as _gdelt  # noqa: F401  registers kind="gdelt"
+from . import github as _github  # noqa: F401  registers kind="github_trending" and "github_search"
 from . import hn as _hn  # noqa: F401  registers kind="hn"
 from . import reddit as _reddit  # noqa: F401  registers kind="reddit"
 from . import rss as _rss  # noqa: F401  registers kind="rss"

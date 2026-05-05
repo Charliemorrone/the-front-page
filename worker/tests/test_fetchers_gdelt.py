@@ -258,7 +258,7 @@ def test_parse_omits_empty_query_metadata_keys():
 # ── fetch_gdelt with MockTransport ────────────────────────────────────────────
 
 
-async def test_fetch_constructs_query_url_with_all_required_params(patch_client):
+async def test_fetch_constructs_query_url_with_all_required_params(patch_client, conn):
     captured: list[httpx.URL] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -266,7 +266,7 @@ async def test_fetch_constructs_query_url_with_all_required_params(patch_client)
         return httpx.Response(200, json={"articles": []})
 
     patch_client(handler)
-    await fetch_gdelt(_task(query="AI funding"))
+    await fetch_gdelt(conn, _task(query="AI funding"))
 
     assert len(captured) == 1
     url = captured[0]
@@ -280,7 +280,7 @@ async def test_fetch_constructs_query_url_with_all_required_params(patch_client)
     assert params["sort"] == "DateDesc"
 
 
-async def test_fetch_returns_normalized_items(patch_client):
+async def test_fetch_returns_normalized_items(patch_client, conn):
     body = {
         "articles": [
             _article(url="https://x.example/a", title="A"),
@@ -292,7 +292,7 @@ async def test_fetch_returns_normalized_items(patch_client):
         return httpx.Response(200, json=body)
 
     patch_client(handler)
-    items = await fetch_gdelt(_task())
+    items = await fetch_gdelt(conn, _task())
 
     assert {i.title for i in items} == {"A", "B"}
     # The fetcher injects the resolved query+query_url into per-item metadata
@@ -300,7 +300,7 @@ async def test_fetch_returns_normalized_items(patch_client):
     assert all(item.metadata["query_url"].startswith(API_URL + "?") for item in items)
 
 
-async def test_fetch_5xx_propagates_as_http_status_error(patch_client):
+async def test_fetch_5xx_propagates_as_http_status_error(patch_client, conn):
     """Failing the GDELT call is a task-level failure — runner records `failed`."""
 
     def handler(_request):
@@ -308,19 +308,19 @@ async def test_fetch_5xx_propagates_as_http_status_error(patch_client):
 
     patch_client(handler)
     with pytest.raises(httpx.HTTPStatusError):
-        await fetch_gdelt(_task())
+        await fetch_gdelt(conn, _task())
 
 
-async def test_fetch_4xx_propagates_as_http_status_error(patch_client):
+async def test_fetch_4xx_propagates_as_http_status_error(patch_client, conn):
     def handler(_request):
         return httpx.Response(400, text="bad request")
 
     patch_client(handler)
     with pytest.raises(httpx.HTTPStatusError):
-        await fetch_gdelt(_task())
+        await fetch_gdelt(conn, _task())
 
 
-async def test_fetch_degrades_to_empty_on_unexpected_body(patch_client):
+async def test_fetch_degrades_to_empty_on_unexpected_body(patch_client, conn):
     """If GDELT returns 200 with a body that has no `articles`, we get [],
     not an exception. The run is more useful with zero GDELT items than failed."""
 
@@ -328,11 +328,11 @@ async def test_fetch_degrades_to_empty_on_unexpected_body(patch_client):
         return httpx.Response(200, json={"status": "noresults"})
 
     patch_client(handler)
-    items = await fetch_gdelt(_task())
+    items = await fetch_gdelt(conn, _task())
     assert items == []
 
 
-async def test_fetch_records_ua_with_contact(patch_client):
+async def test_fetch_records_ua_with_contact(patch_client, conn):
     captured: dict = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -340,12 +340,12 @@ async def test_fetch_records_ua_with_contact(patch_client):
         return httpx.Response(200, json={"articles": []})
 
     patch_client(handler)
-    await fetch_gdelt(_task())
+    await fetch_gdelt(conn, _task())
     assert "ClawFeed-Intel" in (captured["ua"] or "")
     assert "+contact:" in (captured["ua"] or "")
 
 
-async def test_fetch_rejects_non_gdelt_task():
+async def test_fetch_rejects_non_gdelt_task(conn):
     from clawfeed_intel.sources import RssTask
 
     bad = ResolvedTask(
@@ -356,7 +356,7 @@ async def test_fetch_rejects_non_gdelt_task():
         source_name="x",
     )
     with pytest.raises(TypeError, match="expected GdeltTask"):
-        await fetch_gdelt(bad)
+        await fetch_gdelt(conn, bad)
 
 
 # ── registration ──────────────────────────────────────────────────────────────

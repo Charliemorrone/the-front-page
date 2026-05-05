@@ -40,6 +40,7 @@ from __future__ import annotations
 import html
 import json
 import logging
+import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote, urlencode
@@ -62,8 +63,13 @@ EXCERPT_CHARS = 320
 _POST_KIND = "t3"
 
 
-async def fetch_reddit(task: ResolvedTask) -> list[FetchedItem]:
-    """Fetch one subreddit listing and return normalized items."""
+async def fetch_reddit(conn: sqlite3.Connection, task: ResolvedTask) -> list[FetchedItem]:
+    """Fetch one subreddit listing and return normalized items.
+
+    ``conn`` is part of the unified fetcher contract; Reddit does not touch
+    the database (only GitHub does).
+    """
+    del conn
     if not isinstance(task.task, RedditTask):
         raise TypeError(f"fetch_reddit expected RedditTask, got {type(task.task).__name__}")
 

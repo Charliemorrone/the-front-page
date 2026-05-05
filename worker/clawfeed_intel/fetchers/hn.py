@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
@@ -64,8 +65,13 @@ _LIST_ENDPOINTS: dict[str, str] = {
 _ITEM_TYPES_KEPT: frozenset[str] = frozenset({"story", "job", "poll"})
 
 
-async def fetch_hn(task: ResolvedTask) -> list[FetchedItem]:
-    """Fetch one HN list and return normalized items."""
+async def fetch_hn(conn: sqlite3.Connection, task: ResolvedTask) -> list[FetchedItem]:
+    """Fetch one HN list and return normalized items.
+
+    ``conn`` is part of the unified fetcher contract; HN does not touch the
+    database (only GitHub does).
+    """
+    del conn
     if not isinstance(task.task, HnTask):
         raise TypeError(f"fetch_hn expected HnTask, got {type(task.task).__name__}")
 

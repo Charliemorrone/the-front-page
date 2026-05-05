@@ -89,7 +89,7 @@ async def _run_one(
 ) -> FetchOutcome:
     started = time.monotonic()
     try:
-        items = await fetcher(task)
+        items = await fetcher(conn, task)
     except Exception as exc:
         latency_ms = int((time.monotonic() - started) * 1000)
         log.exception("run %d fetch failed: kind=%s source=%r", run_id, task.kind, task.source_name)

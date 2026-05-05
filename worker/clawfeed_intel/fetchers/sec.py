@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import sqlite3
 from datetime import datetime
 from typing import Any
 from urllib.parse import urlencode
@@ -70,13 +71,17 @@ _ACCESSION_RE = re.compile(r"accession-number=([0-9-]+)")
 _TITLE_RE = re.compile(r"^(?P<form>[A-Z0-9/.\-]+)\s*-\s*(?P<company>.+?)\s*\((?P<cik>\d{6,10})\)")
 
 
-async def fetch_sec(task: ResolvedTask) -> list[FetchedItem]:
+async def fetch_sec(conn: sqlite3.Connection, task: ResolvedTask) -> list[FetchedItem]:
     """Fetch recent SEC filings for the form types named in *task*.
 
     One request per form, fanned out concurrently. Partial successes are
     returned; total failure re-raises so the runner records the task as
     failed.
+
+    ``conn`` is part of the unified fetcher contract; SEC does not touch
+    the database (only GitHub does).
     """
+    del conn
     if not isinstance(task.task, SecEdgarTask):
         raise TypeError(f"fetch_sec expected SecEdgarTask, got {type(task.task).__name__}")
     # task.task.ciks is reserved for Phase 7 topical search where

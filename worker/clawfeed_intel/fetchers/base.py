@@ -1,9 +1,15 @@
 """Fetcher contract: what fetchers consume, what they produce.
 
-A fetcher is just an async callable: ``ResolvedTask -> list[FetchedItem]``.
+A fetcher is an async callable: ``(Connection, ResolvedTask) -> list[FetchedItem]``.
 No class hierarchy, no Protocol required at runtime — keeping the surface
-flat means the upcoming RSS/arXiv/HN/SEC/GDELT/Reddit/GitHub/website fetchers
-can each be one async function in its own module.
+flat means each of the eight fetchers (RSS / arXiv / HN / SEC / GDELT /
+Reddit / GitHub / website) can be one async function in its own module.
+
+The connection is passed because some fetchers need DB access during the
+fetch — most prominently GitHub, which records per-repo star/fork
+observations to ``github_repo_observations`` and reads velocity back to
+attach to each item's metadata. Fetchers that don't need DB access (every
+fetcher except GitHub today) accept the parameter and ignore it.
 
 ``FetchedItem`` shapes match :func:`db.upsert_raw_item`'s parameters so the
 runner can pass items through with no translation. ``source_type`` carries
@@ -14,6 +20,7 @@ on, alongside ``dedup_key``.
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -91,7 +98,7 @@ class FetchOutcome:
     error: str | None = None
 
 
-FetcherCallable = Callable[[ResolvedTask], Awaitable[list[FetchedItem]]]
+FetcherCallable = Callable[[sqlite3.Connection, ResolvedTask], Awaitable[list[FetchedItem]]]
 
 
 # Module-level registry. Concrete fetcher modules register themselves at

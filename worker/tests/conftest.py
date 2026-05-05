@@ -63,3 +63,19 @@ def temp_db(tmp_path: Path) -> Path:
     db_path = tmp_path / "digest.db"
     _apply_migrations(db_path)
     return db_path
+
+
+@pytest.fixture
+def conn() -> sqlite3.Connection:
+    """A throwaway in-memory SQLite connection for fetcher tests.
+
+    The fetcher contract takes ``(conn, task)``; most fetchers ignore the
+    connection (only GitHub uses it). A fresh ``:memory:`` connection per
+    test is cheap and avoids any cross-test state leakage. Tests that do
+    need the DB applied use :func:`temp_db` and open their own connection.
+    """
+    c = sqlite3.connect(":memory:")
+    try:
+        yield c
+    finally:
+        c.close()

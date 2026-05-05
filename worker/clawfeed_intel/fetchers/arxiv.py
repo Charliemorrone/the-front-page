@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import re
+import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlencode
@@ -61,8 +62,13 @@ _ABS_PATH_PREFIX = "/abs/"
 _WHITESPACE_RE = re.compile(r"\s+")
 
 
-async def fetch_arxiv(task: ResolvedTask) -> list[FetchedItem]:
-    """Fetch arXiv submissions for the categories named in *task*."""
+async def fetch_arxiv(conn: sqlite3.Connection, task: ResolvedTask) -> list[FetchedItem]:
+    """Fetch arXiv submissions for the categories named in *task*.
+
+    ``conn`` is part of the unified fetcher contract; arXiv does not touch
+    the database (only GitHub does).
+    """
+    del conn
     if not isinstance(task.task, ArxivTask):
         raise TypeError(f"fetch_arxiv expected ArxivTask, got {type(task.task).__name__}")
 

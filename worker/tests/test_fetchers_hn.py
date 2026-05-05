@@ -247,7 +247,7 @@ def test_parse_ignores_invalid_time():
         ("ask", "askstories.json"),
     ],
 )
-async def test_fetch_routes_to_correct_list_endpoint(patch_client, list_name, expected_path):
+async def test_fetch_routes_to_correct_list_endpoint(patch_client, list_name, expected_path, conn):
     captured: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -259,13 +259,13 @@ async def test_fetch_routes_to_correct_list_endpoint(patch_client, list_name, ex
         return httpx.Response(404, json={"unexpected": url})
 
     patch_client(handler)
-    items = await fetch_hn(_task(list_name=list_name))
+    items = await fetch_hn(conn, _task(list_name=list_name))
 
     assert items == []
     assert any(expected_path in u for u in captured)
 
 
-async def test_fetch_returns_normalized_items(patch_client):
+async def test_fetch_returns_normalized_items(patch_client, conn):
     routes = {
         f"{API_BASE}/topstories.json": httpx.Response(200, json=[1, 2]),
         f"{API_BASE}/item/1.json": httpx.Response(
@@ -276,13 +276,13 @@ async def test_fetch_returns_normalized_items(patch_client):
         ),
     }
     patch_client(routes)
-    items = await fetch_hn(_task())
+    items = await fetch_hn(conn, _task())
 
     assert {i.dedup_key for i in items} == {"1", "2"}
     assert {i.title for i in items} == {"One", "Two"}
 
 
-async def test_fetch_truncates_to_limit(patch_client):
+async def test_fetch_truncates_to_limit(patch_client, conn):
     routes: dict[str, Any] = {
         f"{API_BASE}/topstories.json": httpx.Response(200, json=list(range(1, 11))),
     }
@@ -290,13 +290,13 @@ async def test_fetch_truncates_to_limit(patch_client):
         routes[f"{API_BASE}/item/{n}.json"] = httpx.Response(200, json=_story(n))
 
     patch_client(routes)
-    items = await fetch_hn(_task(limit=3))
+    items = await fetch_hn(conn, _task(limit=3))
 
     # Only items 1, 2, 3 should be fetched and returned
     assert {i.dedup_key for i in items} == {"1", "2", "3"}
 
 
-async def test_fetch_applies_min_score_filter(patch_client):
+async def test_fetch_applies_min_score_filter(patch_client, conn):
     routes = {
         f"{API_BASE}/topstories.json": httpx.Response(200, json=[1, 2, 3]),
         f"{API_BASE}/item/1.json": httpx.Response(200, json=_story(1, score=50)),
@@ -304,13 +304,13 @@ async def test_fetch_applies_min_score_filter(patch_client):
         f"{API_BASE}/item/3.json": httpx.Response(200, json=_story(3, score=100)),
     }
     patch_client(routes)
-    items = await fetch_hn(_task(min_score=100))
+    items = await fetch_hn(conn, _task(min_score=100))
 
     # Only items with score >= 100 survive
     assert {i.dedup_key for i in items} == {"2", "3"}
 
 
-async def test_fetch_skips_null_item_response(patch_client):
+async def test_fetch_skips_null_item_response(patch_client, conn):
     """Deleted HN items return JSON `null`. Skip without aborting the batch."""
     routes = {
         f"{API_BASE}/topstories.json": httpx.Response(200, json=[1, 2]),
@@ -318,12 +318,12 @@ async def test_fetch_skips_null_item_response(patch_client):
         f"{API_BASE}/item/2.json": httpx.Response(200, json=_story(2, title="alive")),
     }
     patch_client(routes)
-    items = await fetch_hn(_task())
+    items = await fetch_hn(conn, _task())
 
     assert {i.dedup_key for i in items} == {"2"}
 
 
-async def test_per_item_failure_does_not_abort_batch(patch_client):
+async def test_per_item_failure_does_not_abort_batch(patch_client, conn):
     """Load-bearing: one 5xx item must not poison the rest of the task."""
     routes = {
         f"{API_BASE}/topstories.json": httpx.Response(200, json=[1, 2, 3]),
@@ -332,12 +332,12 @@ async def test_per_item_failure_does_not_abort_batch(patch_client):
         f"{API_BASE}/item/3.json": httpx.Response(200, json=_story(3, title="C")),
     }
     patch_client(routes)
-    items = await fetch_hn(_task())
+    items = await fetch_hn(conn, _task())
 
     assert {i.dedup_key for i in items} == {"1", "3"}
 
 
-async def test_list_endpoint_failure_propagates(patch_client):
+async def test_list_endpoint_failure_propagates(patch_client, conn):
     """Failing to fetch the list itself is a task-level failure — runner records it."""
 
     def handler(_request):
@@ -345,20 +345,20 @@ async def test_list_endpoint_failure_propagates(patch_client):
 
     patch_client(handler)
     with pytest.raises(httpx.HTTPStatusError):
-        await fetch_hn(_task())
+        await fetch_hn(conn, _task())
 
 
-async def test_list_endpoint_returns_non_array_yields_empty(patch_client):
+async def test_list_endpoint_returns_non_array_yields_empty(patch_client, conn):
     """If HN ever returns something unexpected, we degrade to empty rather
     than raise — the run is more useful with zero HN items than a failed run."""
     routes = {
         f"{API_BASE}/topstories.json": httpx.Response(200, json={"unexpected": "shape"}),
     }
     patch_client(routes)
-    assert await fetch_hn(_task()) == []
+    assert await fetch_hn(conn, _task()) == []
 
 
-async def test_fetch_records_ua_with_contact(patch_client):
+async def test_fetch_records_ua_with_contact(patch_client, conn):
     captured: dict = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -366,12 +366,12 @@ async def test_fetch_records_ua_with_contact(patch_client):
         return httpx.Response(200, json=[])
 
     patch_client(handler)
-    await fetch_hn(_task())
+    await fetch_hn(conn, _task())
     assert "ClawFeed-Intel" in (captured["ua"] or "")
     assert "+contact:" in (captured["ua"] or "")
 
 
-async def test_fetch_rejects_non_hn_task():
+async def test_fetch_rejects_non_hn_task(conn):
     from clawfeed_intel.sources import RssTask
 
     bad = ResolvedTask(
@@ -382,7 +382,7 @@ async def test_fetch_rejects_non_hn_task():
         source_name="x",
     )
     with pytest.raises(TypeError, match="expected HnTask"):
-        await fetch_hn(bad)
+        await fetch_hn(conn, bad)
 
 
 # ── registration ──────────────────────────────────────────────────────────────

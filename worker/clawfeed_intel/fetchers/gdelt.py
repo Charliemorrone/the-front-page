@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlencode
@@ -65,8 +66,13 @@ EXCERPT_CHARS = 320
 _SEENDATE_FMT = "%Y%m%dT%H%M%SZ"
 
 
-async def fetch_gdelt(task: ResolvedTask) -> list[FetchedItem]:
-    """Run one GDELT query and return normalized items."""
+async def fetch_gdelt(conn: sqlite3.Connection, task: ResolvedTask) -> list[FetchedItem]:
+    """Run one GDELT query and return normalized items.
+
+    ``conn`` is part of the unified fetcher contract; GDELT does not touch
+    the database (only GitHub does).
+    """
+    del conn
     if not isinstance(task.task, GdeltTask):
         raise TypeError(f"fetch_gdelt expected GdeltTask, got {type(task.task).__name__}")
 

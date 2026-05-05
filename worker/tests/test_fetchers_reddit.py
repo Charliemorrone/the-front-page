@@ -387,7 +387,7 @@ def test_parse_records_over_18_flag():
 
 
 @pytest.mark.parametrize("sort", ["hot", "new", "top", "rising"])
-async def test_fetch_routes_to_correct_sort_path(patch_client, sort):
+async def test_fetch_routes_to_correct_sort_path(patch_client, sort, conn):
     captured: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -395,13 +395,13 @@ async def test_fetch_routes_to_correct_sort_path(patch_client, sort):
         return httpx.Response(200, json=_listing())
 
     patch_client(handler)
-    await fetch_reddit(_task(sort=sort))
+    await fetch_reddit(conn, _task(sort=sort))
 
     assert len(captured) == 1
     assert f"/r/MachineLearning/{sort}.json" in captured[0]
 
 
-async def test_fetch_passes_default_limit_when_unset(patch_client):
+async def test_fetch_passes_default_limit_when_unset(patch_client, conn):
     captured: list[httpx.URL] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -409,11 +409,11 @@ async def test_fetch_passes_default_limit_when_unset(patch_client):
         return httpx.Response(200, json=_listing())
 
     patch_client(handler)
-    await fetch_reddit(_task())  # limit=None
+    await fetch_reddit(conn, _task())  # limit=None
     assert dict(captured[0].params)["limit"] == str(DEFAULT_LIMIT)
 
 
-async def test_fetch_passes_custom_limit_when_set(patch_client):
+async def test_fetch_passes_custom_limit_when_set(patch_client, conn):
     captured: list[httpx.URL] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -421,11 +421,11 @@ async def test_fetch_passes_custom_limit_when_set(patch_client):
         return httpx.Response(200, json=_listing())
 
     patch_client(handler)
-    await fetch_reddit(_task(limit=25))
+    await fetch_reddit(conn, _task(limit=25))
     assert dict(captured[0].params)["limit"] == "25"
 
 
-async def test_fetch_url_encodes_subreddit_name(patch_client):
+async def test_fetch_url_encodes_subreddit_name(patch_client, conn):
     """Cheap insurance against unusual chars in config typos."""
     captured: list[str] = []
 
@@ -434,11 +434,11 @@ async def test_fetch_url_encodes_subreddit_name(patch_client):
         return httpx.Response(200, json=_listing())
 
     patch_client(handler)
-    await fetch_reddit(_task(subreddit="weird name"))
+    await fetch_reddit(conn, _task(subreddit="weird name"))
     assert "weird%20name" in captured[0]
 
 
-async def test_fetch_returns_normalized_items(patch_client):
+async def test_fetch_returns_normalized_items(patch_client, conn):
     body = _listing(
         _post("a01", title="Alpha", url="https://x.example/a"),
         _post("b02", title="Beta", url="https://y.example/b"),
@@ -448,23 +448,23 @@ async def test_fetch_returns_normalized_items(patch_client):
         return httpx.Response(200, json=body)
 
     patch_client(handler)
-    items = await fetch_reddit(_task())
+    items = await fetch_reddit(conn, _task())
     assert {i.title for i in items} == {"Alpha", "Beta"}
     # The fetcher injects the resolved subreddit + sort into per-item metadata
     assert all(i.metadata["subreddit"] == "MachineLearning" for i in items)
     assert all(i.metadata["sort"] == "hot" for i in items)
 
 
-async def test_fetch_5xx_propagates_as_http_status_error(patch_client):
+async def test_fetch_5xx_propagates_as_http_status_error(patch_client, conn):
     def handler(_request):
         return httpx.Response(503, text="upstream unavailable")
 
     patch_client(handler)
     with pytest.raises(httpx.HTTPStatusError):
-        await fetch_reddit(_task())
+        await fetch_reddit(conn, _task())
 
 
-async def test_fetch_429_rate_limit_propagates(patch_client):
+async def test_fetch_429_rate_limit_propagates(patch_client, conn):
     """Reddit returns 429 when over quota. Daily-cadence shouldn't trip it,
     but if it does, we want the runner to record `failed` (not silently
     drop the subreddit). Backoff is a future concern."""
@@ -474,10 +474,10 @@ async def test_fetch_429_rate_limit_propagates(patch_client):
 
     patch_client(handler)
     with pytest.raises(httpx.HTTPStatusError):
-        await fetch_reddit(_task())
+        await fetch_reddit(conn, _task())
 
 
-async def test_fetch_403_propagates(patch_client):
+async def test_fetch_403_propagates(patch_client, conn):
     """Private/banned subs return 403 — surface as failed so coverage is honest."""
 
     def handler(_request):
@@ -485,10 +485,10 @@ async def test_fetch_403_propagates(patch_client):
 
     patch_client(handler)
     with pytest.raises(httpx.HTTPStatusError):
-        await fetch_reddit(_task(subreddit="privatesub"))
+        await fetch_reddit(conn, _task(subreddit="privatesub"))
 
 
-async def test_fetch_records_ua_with_contact(patch_client):
+async def test_fetch_records_ua_with_contact(patch_client, conn):
     """Reddit's API guidance asks for a UA with contact info."""
     captured: dict = {}
 
@@ -497,12 +497,12 @@ async def test_fetch_records_ua_with_contact(patch_client):
         return httpx.Response(200, json=_listing())
 
     patch_client(handler)
-    await fetch_reddit(_task())
+    await fetch_reddit(conn, _task())
     assert "ClawFeed-Intel" in (captured["ua"] or "")
     assert "+contact:" in (captured["ua"] or "")
 
 
-async def test_fetch_rejects_non_reddit_task():
+async def test_fetch_rejects_non_reddit_task(conn):
     from clawfeed_intel.sources import RssTask
 
     bad = ResolvedTask(
@@ -513,7 +513,7 @@ async def test_fetch_rejects_non_reddit_task():
         source_name="x",
     )
     with pytest.raises(TypeError, match="expected RedditTask"):
-        await fetch_reddit(bad)
+        await fetch_reddit(conn, bad)
 
 
 # ── registration ──────────────────────────────────────────────────────────────

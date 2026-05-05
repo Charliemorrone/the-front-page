@@ -123,7 +123,7 @@ async def test_success_persists_items_and_updates_coverage(temp_db):
         run_id = _make_run(conn)
         sid = _add_source(conn, "rss-x")
 
-        async def fetch(_task):
+        async def fetch(_conn, _task):
             return _items("https://x.example/a", "https://x.example/b")
 
         task = _db_task(sid, "rss-x")
@@ -154,7 +154,7 @@ async def test_success_writes_run_membership_and_fetch_state(temp_db):
         run_id = _make_run(conn)
         sid = _add_source(conn, "rss-x")
 
-        async def fetch(_task):
+        async def fetch(_conn, _task):
             return _items("https://x.example/a", "https://x.example/b")
 
         task = _db_task(sid, "rss-x")
@@ -191,7 +191,7 @@ async def test_yaml_origin_task_does_not_touch_fetch_state(temp_db):
     with closing(worker_db.connect(temp_db)) as conn:
         run_id = _make_run(conn)
 
-        async def fetch(_task):
+        async def fetch(_conn, _task):
             return _items("https://x.example/a")
 
         task = _yaml_task()
@@ -215,7 +215,7 @@ async def test_idempotent_rerun_records_zero_new(temp_db):
         run_id_1 = _make_run(conn)
         sid = _add_source(conn, "rss-x")
 
-        async def fetch(_task):
+        async def fetch(_conn, _task):
             return _items("https://x.example/a", "https://x.example/b")
 
         task = _db_task(sid, "rss-x")
@@ -258,7 +258,7 @@ async def test_fetcher_exception_becomes_failed_outcome(temp_db):
         run_id = _make_run(conn)
         sid = _add_source(conn, "rss-x")
 
-        async def fetch(_task):
+        async def fetch(_conn, _task):
             raise TimeoutError("upstream feed timed out")
 
         task = _db_task(sid, "rss-x")
@@ -286,7 +286,7 @@ async def test_fetcher_failure_records_fetch_state(temp_db):
         run_id = _make_run(conn)
         sid = _add_source(conn, "rss-x")
 
-        async def fetch(_task):
+        async def fetch(_conn, _task):
             raise RuntimeError("boom")
 
         task = _db_task(sid, "rss-x")
@@ -316,7 +316,7 @@ async def test_one_failure_does_not_kill_other_tasks(temp_db):
         sid_ok = _add_source(conn, "rss-ok")
         sid_bad = _add_source(conn, "rss-bad")
 
-        async def fetch(task):
+        async def fetch(_conn, task):
             if task.source_name == "rss-bad":
                 raise RuntimeError("boom")
             return _items("https://x.example/a")
@@ -350,7 +350,7 @@ async def test_per_item_upsert_failure_does_not_kill_batch(monkeypatch, temp_db)
     with closing(worker_db.connect(temp_db)) as conn:
         run_id = _make_run(conn)
 
-        async def fetch(_task):
+        async def fetch(_conn, _task):
             return _items("https://x.example/a", "https://x.example/b", "https://x.example/c")
 
         task = _yaml_task()
@@ -406,7 +406,7 @@ async def test_no_fetcher_for_kind_records_skipped(temp_db):
         coverage = Coverage()
 
         # Only RSS has a fetcher; gdelt should be skipped.
-        async def fetch_rss(_task):
+        async def fetch_rss(_conn, _task):
             return _items("https://x.example/a")
 
         outcomes = await run_fetch_stage(
@@ -502,7 +502,7 @@ async def test_tasks_of_same_kind_run_concurrently(temp_db):
     with closing(worker_db.connect(temp_db)) as conn:
         run_id = _make_run(conn)
 
-        async def slow(_task):
+        async def slow(_conn, _task):
             await asyncio.sleep(0.05)
             return []
 
