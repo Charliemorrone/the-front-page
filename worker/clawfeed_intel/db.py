@@ -17,9 +17,10 @@ import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from .paths import DB_PATH
 
@@ -452,3 +453,151 @@ def record_fetch_failure(
             """,
             (source_id, fetcher, now, error),
         )
+
+
+# ── github_repo_observations ──────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class RepoVelocity:
+    """Star/fork delta for a GitHub repository over a recent observation window.
+
+    Computed from ``github_repo_observations`` rows whose ``observed_at`` falls
+    within the requested window. ``earliest`` and ``latest`` are by *time of
+    observation*, not by star count — for "gaining traction" the time-ordered
+    delta is what matters; using min/max of stars would conflate temporary
+    unstar dips with the trend.
+    """
+
+    full_name: str
+    star_delta: int
+    fork_delta: int | None
+    days_observed: float
+    earliest_stars: int
+    latest_stars: int
+    earliest_at: str
+    latest_at: str
+    observation_count: int
+
+
+def record_repo_observation(
+    conn: sqlite3.Connection,
+    *,
+    full_name: str,
+    stars: int,
+    discovered_via: Literal["trending", "search"],
+    forks: int | None = None,
+    watchers: int | None = None,
+    open_issues: int | None = None,
+    language: str | None = None,
+    topics: list[str] | None = None,
+    pushed_at: str | None = None,
+    observed_at: str | None = None,
+) -> int:
+    """Record one observation of a GitHub repository's state.
+
+    Each call appends a new row — observations accumulate so velocity can be
+    computed across runs. The fetcher passes the same ``observed_at`` for
+    every repo in a single fetch so a daily run produces a coherent snapshot.
+    Returns the inserted row id.
+    """
+    if not full_name or not full_name.strip():
+        raise ValueError("full_name is required")
+    if stars < 0:
+        raise ValueError("stars must be non-negative")
+
+    when = observed_at or _utc_now_iso()
+    topics_json = json.dumps(list(topics or []), separators=(",", ":"), sort_keys=False)
+
+    with transaction(conn):
+        cur = conn.execute(
+            """
+            INSERT INTO github_repo_observations
+                (full_name, observed_at, stars, forks, watchers, open_issues,
+                 language, topics, pushed_at, discovered_via)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                full_name.strip(),
+                when,
+                int(stars),
+                forks,
+                watchers,
+                open_issues,
+                language,
+                topics_json,
+                pushed_at,
+                discovered_via,
+            ),
+        )
+        return int(cur.lastrowid or 0)
+
+
+def get_repo_velocity(
+    conn: sqlite3.Connection,
+    *,
+    full_name: str,
+    window_days: int = 7,
+    reference_at: str | None = None,
+) -> RepoVelocity | None:
+    """Compute the star/fork delta for a repo over the recent observation window.
+
+    Returns ``None`` when fewer than two observations exist in the window —
+    Day-1 has no velocity by definition (architecture doc explicitly accepts
+    this). Pulling observations from before the window would conflate
+    historical levels with current trend, so we don't.
+
+    ``reference_at`` (UTC ISO) lets tests pin "now" without needing freezegun;
+    in production callers omit it and the helper uses wall-clock time.
+    """
+    if window_days <= 0:
+        raise ValueError("window_days must be positive")
+    if not full_name or not full_name.strip():
+        raise ValueError("full_name is required")
+
+    ref = (
+        datetime.fromisoformat(reference_at)
+        if reference_at is not None
+        else datetime.now(timezone.utc)
+    )
+    if ref.tzinfo is None:
+        raise ValueError("reference_at must be timezone-aware")
+    threshold = (ref - timedelta(days=window_days)).isoformat(timespec="seconds")
+
+    rows = conn.execute(
+        """
+        SELECT observed_at, stars, forks
+          FROM github_repo_observations
+         WHERE full_name = ?
+           AND observed_at >= ?
+         ORDER BY observed_at ASC
+        """,
+        (full_name.strip(), threshold),
+    ).fetchall()
+
+    if len(rows) < 2:
+        return None
+
+    earliest = rows[0]
+    latest = rows[-1]
+    earliest_at = datetime.fromisoformat(earliest["observed_at"])
+    latest_at = datetime.fromisoformat(latest["observed_at"])
+    days = (latest_at - earliest_at).total_seconds() / 86400.0
+
+    fork_delta: int | None
+    if earliest["forks"] is not None and latest["forks"] is not None:
+        fork_delta = int(latest["forks"]) - int(earliest["forks"])
+    else:
+        fork_delta = None
+
+    return RepoVelocity(
+        full_name=full_name.strip(),
+        star_delta=int(latest["stars"]) - int(earliest["stars"]),
+        fork_delta=fork_delta,
+        days_observed=days,
+        earliest_stars=int(earliest["stars"]),
+        latest_stars=int(latest["stars"]),
+        earliest_at=earliest["observed_at"],
+        latest_at=latest["observed_at"],
+        observation_count=len(rows),
+    )

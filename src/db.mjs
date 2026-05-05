@@ -109,6 +109,13 @@ export function getDb(dbPath) {
   } catch (e) {
     if (!e.message.includes('already exists')) console.error('Migration 010:', e.message);
   }
+  // Migration 011: github_repo_observations (per-repo star/fork snapshots for velocity)
+  try {
+    const sql11 = readFileSync(join(ROOT, 'migrations', '011_github_observations.sql'), 'utf8');
+    _db.exec(sql11);
+  } catch (e) {
+    if (!e.message.includes('already exists')) console.error('Migration 011:', e.message);
+  }
   // Backfill slugs for existing users
   _backfillSlugs(_db);
   return _db;

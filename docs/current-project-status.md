@@ -3,7 +3,7 @@
 **Source of truth for engineers building this system. Update after every critical change.**
 
 - Repo: `/Users/merlin/clawfeed`
-- Last updated: 2026-05-05 (Phase 1 step 6.6 — Reddit fetcher)
+- Last updated: 2026-05-05 (Phase 1 step 6.7a — GitHub observations schema + DB layer)
 - Last update by: implementation engineer (Claude)
 - Authoritative design docs:
   - [personal-intelligence-brief-architecture.md](personal-intelligence-brief-architecture.md) — full architecture
@@ -43,13 +43,17 @@ Hard requirements that must be preserved at all times:
 
 ### Schema + migration loader
 - [migrations/010_intel_pipeline.sql](../migrations/010_intel_pipeline.sql) — 10 pipeline tables, all idempotent: `intel_runs`, `intel_jobs`, `raw_items`, `run_raw_items`, `item_clusters`, `cluster_items`, `item_summaries`, `llm_calls`, `source_fetch_state`, `source_categories`.
-- [src/db.mjs](../src/db.mjs#L94-L100) — migration 010 wired into the existing migration loader chain; matches the 008/009 pattern.
-- Verified: live DB has all 10 tables; re-applying the migration is a no-op.
+- [migrations/011_github_observations.sql](../migrations/011_github_observations.sql) — `github_repo_observations` table for per-repo star/fork velocity tracking. One row per (repo, observation); the GitHub fetcher will write a row per repo per fetch and `get_repo_velocity` reads them back. Indexed `(full_name, observed_at DESC)` for the lookup pattern and `(observed_at)` for retention pruning.
+- [src/db.mjs](../src/db.mjs) — migrations 010 and 011 wired into the existing migration loader chain; matches the 008/009 pattern.
+- Verified: live DB has all 11 intel tables; re-applying the migration is a no-op.
 
 ### Worker scaffold
 - [worker/pyproject.toml](../worker/pyproject.toml) — Python 3.12 + `uv`. Runtime deps: `httpx`, `feedparser`, `trafilatura`, `selectolax`, `pydantic`, `tenacity`, `PyYAML`, `python-dotenv`. Dev deps: `pytest`, `pytest-asyncio`, `ruff`. Console script `clawfeed-intel`. `pytest pythonpath = ["."]` so tests run without an editable install.
 - [worker/clawfeed_intel/__init__.py](../worker/clawfeed_intel/__init__.py) — `__version__ = "0.1.0"`.
 - [worker/clawfeed_intel/paths.py](../worker/clawfeed_intel/paths.py) — repo-root-relative paths; `DIGEST_DB` env var override supported.
+
+### GitHub observations storage layer
+- [worker/clawfeed_intel/db.py](../worker/clawfeed_intel/db.py) — `RepoVelocity` frozen dataclass + `record_repo_observation(...)` (insert-only, one row per fetch; `discovered_via` ∈ {`trending`, `search`} enforced by SQL CHECK) + `get_repo_velocity(*, full_name, window_days=7, reference_at=None) -> RepoVelocity | None`. Velocity is the **time-ordered delta** within the window (earliest-by-time vs latest-by-time stars), not min/max — a temporary unstar wave should not depress the gain. `reference_at` lets tests pin "now" without a freezegun dependency. Returns `None` when fewer than 2 observations exist in the window (Day-1 case — accepted in the architecture doc's open risks).
 
 ### Run lifecycle skeleton
 - [worker/clawfeed_intel/db.py](../worker/clawfeed_intel/db.py) — `connect()`, `transaction()` context manager (BEGIN IMMEDIATE + busy_timeout), `RunStateError`. Run CRUD: `create_run`, `get_run`, `mark_run_started`, `advance_run_status`, `update_run_metadata`, `finish_run`. Digest insert: `create_digest`. Status enums (`RUN_TYPES`, `RUN_STATUSES`, `INTERMEDIATE_RUN_STATUSES`, `TERMINAL_RUN_STATUSES`, `DIGEST_TYPES`) mirror SQL CHECK constraints and validate at the boundary.
@@ -114,7 +118,8 @@ Hard requirements that must be preserved at all times:
 - [worker/tests/test_fetchers_gdelt.py](../worker/tests/test_fetchers_gdelt.py) — 25 tests: pure `parse_gdelt_response` over hand-built JSON + dict fixtures — full-fields happy path, dict-input acceptance, missing-url skip, missing-title skip, **UTM-syndication dedup_key collapse** (two URLs with different tracking suffixes fold to one canonical dedup_key), missing/malformed `seendate`, missing optional metadata keys, missing `articles` key → empty, non-list `articles` → empty, malformed JSON → empty, empty body → empty, unexpected input type → empty, control chars in title rescued via `strict=False`, non-dict article entry skipped, empty-query-metadata keys omitted. Plus MockTransport tests verifying query-URL construction (every required GDELT param present: `query`, `mode=ArtList`, `format=JSON`, `timespan=24h`, `maxrecords=250`, `sort=DateDesc`), 5xx + 4xx propagate as `HTTPStatusError` (runner records `failed`), 200-with-no-articles degrades to empty (run more useful with zero items than failed), contact-bearing UA verified, non-gdelt task → `TypeError`. Registration sanity check.
 - [worker/tests/test_fetchers_reddit.py](../worker/tests/test_fetchers_reddit.py) — 32 tests: pure `parse_reddit_listing` over hand-built `Listing` JSON — link post (full-fields incl. UTM canonical_url stripping), self post (HTML-entity-decoded selftext, Markdown formatting preserved, no `external_url` in metadata), removed-post skip (`removed_by_category`), stickied-post skip, untitled skip, comment-kind (`t1`) skip, **load-bearing cross-subreddit-distinct-keys** (same article submitted to two subs → two distinct dedup_keys, same canonical_url), missing optional fields, fallback fullname construction when `name` absent but `id` present, non-Listing kind → empty (Reddit error responses), missing `children` key → empty, malformed JSON → empty, empty body → empty, `selftext_html` stripped from `raw_payload` (5–10× bloat avoided), no-url-no-permalink skip, invalid `created_utc` → null `published_at`, `over_18` flag round-trip. Plus MockTransport tests parametrized over all 4 sorts (hot/new/top/rising) verifying path routing, default vs custom `limit` query construction, subreddit URL-encoding (cheap insurance against config typos), 5xx + 4xx + **429 rate-limit** + **403 private-sub** all propagate as `HTTPStatusError`, contact-bearing UA verified (Reddit compliance), non-reddit task → `TypeError`. Registration sanity check.
 - [worker/tests/test_orchestrator.py](../worker/tests/test_orchestrator.py) — 5 tests: existing `run_daily` tests use a `_isolate_config` helper to monkeypatch `DEFAULT_CONFIG_PATH`; the no-fetcher test additionally monkeypatches `runner.FETCHER_REGISTRY` to `{}` so it stays valid as fetcher modules register themselves at import time. New tests cover resolver-wired skipped tasks and resolver `PlanWarning` surfacing in `coverage.plan_warnings`.
-- **Result: 280/280 pass via `uv run pytest` in 6.85s. `uv run ruff check .` and `uv run ruff format --check .` clean.**
+- [worker/tests/test_github_observations.py](../worker/tests/test_github_observations.py) — 20 tests: `record_repo_observation` happy path with all fields, minimum-fields-only, append-not-upsert (each call is a fresh row — velocity needs the full timestamped history), explicit `observed_at` round-trip, blank/whitespace `full_name` rejection, negative-`stars` rejection, **SQL CHECK** rejection of invalid `discovered_via` (`'manual'` raises `IntegrityError`), whitespace stripping. Plus `get_repo_velocity`: None when no observations, None on Day-1 (single observation — accepted), star/fork delta in time order, **load-bearing time-order vs min/max test** (a transient unstar dip must not depress reported velocity), observations outside `window_days` excluded (180-day-old level doesn't enter a 7-day window), wider window pulls older observations in, per-repo isolation, missing-fork-data → `fork_delta = None`, `window_days <= 0` rejection, blank-`full_name` rejection, naive `reference_at` rejection (must be tz-aware), whitespace-tolerant `full_name` lookup matches `record_*` normalization.
+- **Result: 300/300 pass via `uv run pytest` in 7.50s. `uv run ruff check .` and `uv run ruff format --check .` clean.**
 
 ---
 
@@ -128,8 +133,8 @@ _Nothing in flight._
 
 Ordered by dependency. Each is intended to ship as its own small inspectable PR.
 
-1. **Two remaining fetchers**, plugged into `FETCHER_REGISTRY` in this order (RSS in 6.1, arXiv in 6.2, HN in 6.3, SEC in 6.4, GDELT in 6.5, Reddit in 6.6):
-   1. GitHub (Trending HTML for discovery + REST for repo metadata + **daily star snapshots stored in `source_fetch_state.metadata`** for real velocity)
+1. **Two remaining fetchers**, plugged into `FETCHER_REGISTRY` in this order (RSS in 6.1, arXiv in 6.2, HN in 6.3, SEC in 6.4, GDELT in 6.5, Reddit in 6.6, GitHub schema/DB layer in 6.7a):
+   1. **GitHub fetcher (6.7b)** — Trending HTML for discovery (`github_trending` kind) + REST search (`github_search` kind), enriched with the REST repo API for current star/fork/language/topic metadata. Each repo gets a `record_repo_observation` row keyed by `full_name`; `get_repo_velocity` is read for prior runs to attach `velocity` to the FetchedItem. Day-1 has no velocity (accepted); first useful readings appear day 2–3. **Storage substrate landed in 6.7a.**
    2. Websites (configured URLs only; trafilatura extraction; no site-wide crawl)
    The harness is already in place — each fetcher only needs to implement its `async (ResolvedTask) -> list[FetchedItem]` callable and register itself. Fetchers consume `canonicalize_url`, `content_hash`, and the per-source `*_dedup_key` helpers; storage and coverage flow through the runner.
 2. **Dedup + clustering.** Level 1 canonical URL → Level 2 content fingerprint → Level 3 event clustering (entity overlap + numeric facts + date window; LLM tie-breaker only on ambiguous pairs).
@@ -148,7 +153,8 @@ Ordered by dependency. Each is intended to ship as its own small inspectable PR.
 |---|---|---|
 | `digests.type` CHECK only allows `4h`/`daily`/`weekly`/`monthly` | accepted for Phase 1 | Topic briefs (later phase) piggyback on `daily` + `metadata.brief_kind='topic'`. Schema relaxation deferred. |
 | `sources` table has no category column | resolved | New `source_categories(source_id, category)` join table — supports many-to-many. |
-| GitHub velocity needs ≥2 days of snapshots | accepted | Mitigation: start storing star snapshots from the first run; first usable velocity readings appear by day 2–3. |
+| GitHub velocity needs ≥2 days of snapshots | accepted | Mitigation: start storing star snapshots from the first run via `db.record_repo_observation`; `db.get_repo_velocity` returns None on Day-1 by design. First usable velocity readings appear by day 2–3. |
+| Velocity stored in dedicated `github_repo_observations` table, not `source_fetch_state.metadata` | resolved (deviation from handoff hint) | Reason: `source_fetch_state` is keyed by `(source_id, fetcher)` with `source_id NOT NULL`, which excludes the YAML-origin `github_trending` / `github_search` tasks the default config ships with. A per-repo observations table is the right shape — velocity is per-repo, not per-source. |
 | Two-runtime SQLite access (Node `better-sqlite3` + Python `sqlite3`) | accepted | WAL is on; worker writes use `BEGIN IMMEDIATE` and short transactions (<100ms). |
 | Migration loader is open-coded in [src/db.mjs](../src/db.mjs#L30-L107) | accepted | Each migration adds another try/exec block. Refactor to a loop is out of scope for Phase 1. |
 | vMLX availability is assumed but unverified | open | First step of LLM client work is a real `clawfeed-intel doctor` health-check that pings `http://127.0.0.1:8080/v1/models`. |
@@ -250,6 +256,15 @@ _None yet beyond what's captured in the design docs._
 - SEC compliance: their explicit ≤10 req/s ceiling is met trivially (1-2 requests per fetch); the contact-bearing User-Agent comes from `fetchers.http` and is verified by a dedicated test.
 - `worker/tests/test_fetchers_sec.py`: 18 new tests (10 pure-parse + 6 MockTransport + 2 registration). 223 tests pass in 1.93s. ruff check + format clean.
 - **Failure modes verified by tests:** all-form 5xx → `HTTPStatusError` propagates → runner records `failed`. Partial-form 5xx → survivors returned. Malformed XML → empty list. Per-entry parse exception → logged + skipped. Title-parse failure → entry kept with empty company/cik fallback. Non-sec task → `TypeError`.
+
+### 2026-05-05 — GitHub observations schema + DB layer (Phase 1 step 6.7a)
+- **Scope decision**: split GitHub (6.7) into 6.7a (schema + DB helpers) and 6.7b (fetcher). Reasons: schema change is a meaningfully separate concern from fetcher logic; storage shape choice is non-obvious and warrants its own focused review; the fetcher will be one of the larger modules (HTML scrape + REST + velocity) and bundling the migration into it would obscure both.
+- **Storage location decision**: deviated from the handoff hint of using `source_fetch_state.metadata`. `source_fetch_state` requires `source_id NOT NULL` and the default YAML config has `github_trending` / `github_search` as YAML-origin tasks (`source_id=None`), which means they'd never get velocity tracking under that scheme — defeating the headline use case. Velocity is fundamentally per-repo (the same repo can be discovered via both trending and search, by both YAML and DB origin). New table `github_repo_observations` is the correct shape.
+- `migrations/011_github_observations.sql`: idempotent table + two indexes. Columns: `id`, `full_name`, `observed_at`, `stars`, `forks`, `watchers`, `open_issues`, `language`, `topics` (JSON), `pushed_at`, `discovered_via` (CHECK ∈ {`trending`, `search`}). Index `(full_name, observed_at DESC)` for the per-repo lookup; index `(observed_at)` for retention pruning.
+- `src/db.mjs`: migration 011 wired into the loader chain, matching the 008–010 pattern (try/exec block; "already exists" suppressed).
+- `worker/clawfeed_intel/db.py`: added `RepoVelocity` frozen dataclass + `record_repo_observation(...)` (insert-only, returns row id, validates `full_name` non-blank and `stars >= 0`, strips whitespace from full_name, defaults `observed_at` to UTC-now) + `get_repo_velocity(...)` (time-ordered earliest-vs-latest delta within `window_days`, returns `None` for fewer than 2 observations, accepts `reference_at` for deterministic tests, requires tz-aware reference).
+- **Time-ordered velocity decision**: `star_delta = latest.stars - earliest.stars` where earliest/latest are by `observed_at`, not by `MIN/MAX(stars)`. A repo with a temporary unstar wave (e.g. controversy day) shouldn't have its trend depressed by min(stars) — what matters is the trajectory between window endpoints. Verified by a load-bearing test (`test_velocity_uses_time_order_not_star_min_max`).
+- `worker/tests/test_github_observations.py`: 20 new tests (8 record + 12 velocity). 300 tests pass in 7.50s. ruff check + format clean.
 
 ### 2026-05-05 — Reddit fetcher (Phase 1 step 6.6)
 - `worker/clawfeed_intel/fetchers/reddit.py`: registers `kind="reddit"`. Single GET per task to `https://www.reddit.com/r/<sub>/<sort>.json?limit=<n>` (sort is path-based per Reddit convention). Default `limit=100` (Reddit's listing ceiling). Two layers preserved: pure `parse_reddit_listing(body, *, source_name, subreddit, sort)` accepts text or already-parsed dict; async `fetch_reddit(task)` wraps with one HTTP call.
