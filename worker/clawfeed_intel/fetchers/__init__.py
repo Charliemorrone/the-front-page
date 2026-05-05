@@ -21,6 +21,7 @@ from .runner import run_fetch_stage
 # Importing concrete fetcher modules registers them in FETCHER_REGISTRY.
 # Add new fetchers here as their steps land.
 from . import arxiv as _arxiv  # noqa: F401  registers kind="arxiv"
+from . import gdelt as _gdelt  # noqa: F401  registers kind="gdelt"
 from . import hn as _hn  # noqa: F401  registers kind="hn"
 from . import rss as _rss  # noqa: F401  registers kind="rss"
 from . import sec as _sec  # noqa: F401  registers kind="sec_edgar"
