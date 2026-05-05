@@ -176,6 +176,82 @@ categories:
         assert all(c["status"] == "pending" for c in clusters)
 
 
+def test_run_daily_folds_syndicated_items_via_content_hash(temp_db, monkeypatch, tmp_path):
+    """End-to-end L2 check: a fetcher that emits two items with different
+    canonical URLs but identical content_hash should produce ONE cluster,
+    not two — proving that the orchestrator's filtering stage chains
+    L1 → L2 in the persisted state."""
+    from clawfeed_intel.fetchers import FetchedItem
+
+    yaml_body = """
+categories:
+  scratch:
+    sources:
+      - kind: rss
+        url: https://example.com/feed
+"""
+    _isolate_config(monkeypatch, tmp_path, yaml_body)
+
+    async def stub_fetcher(_conn, _task):
+        return [
+            FetchedItem(
+                source_type="rss",
+                dedup_key="orig",
+                title="Original",
+                url="https://example.com/article",
+                canonical_url="https://example.com/article",
+                content="shared body",
+                content_hash="hash-shared",
+            ),
+            FetchedItem(
+                source_type="rss",
+                dedup_key="syn",
+                title="Yahoo's copy",
+                url="https://yahoo.com/article",
+                canonical_url="https://yahoo.com/article",
+                content="shared body",
+                content_hash="hash-shared",
+            ),
+            FetchedItem(
+                source_type="rss",
+                dedup_key="distinct",
+                title="Beta",
+                url="https://example.com/beta",
+                canonical_url="https://example.com/beta",
+                content="different body",
+                content_hash="hash-beta",
+            ),
+        ]
+
+    monkeypatch.setattr(
+        "clawfeed_intel.fetchers.runner.FETCHER_REGISTRY",
+        {"rss": stub_fetcher},
+    )
+
+    with closing(worker_db.connect(temp_db)) as conn:
+        digest_id = run_daily("24h", conn=conn)
+
+        meta = json.loads(
+            conn.execute("SELECT metadata FROM digests WHERE id = ?", (digest_id,)).fetchone()[
+                "metadata"
+            ]
+        )
+        assert meta["coverage"]["raw_items"] == 3
+        assert meta["coverage"]["clusters"] == 2  # L2 collapsed orig+syn → 1; beta stands alone
+
+        run_row = conn.execute(
+            "SELECT id FROM intel_runs WHERE digest_id = ?", (digest_id,)
+        ).fetchone()
+        clusters = conn.execute(
+            "SELECT cluster_key FROM item_clusters WHERE run_id = ? ORDER BY cluster_key",
+            (run_row["id"],),
+        ).fetchall()
+        assert [c["cluster_key"] for c in clusters] == [
+            "https://example.com/article",  # smaller URL from the syndicated pair
+            "https://example.com/beta",
+        ]
+
+
 def test_run_daily_records_resolver_warning_in_coverage(temp_db, monkeypatch, tmp_path):
     """A missing config produces a PlanWarning that surfaces as
     coverage.plan_warnings — the brief should be able to explain why the
