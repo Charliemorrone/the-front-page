@@ -1,0 +1,82 @@
+# Editorial configuration for the Personal Intelligence Brief.
+#
+# This file defines the *editorial intent*: which categories the daily brief
+# covers, what counts as relevant within each, and which non-user-facing
+# structured sources (arXiv, GDELT, SEC EDGAR, GitHub search) feed each beat.
+#
+# User-managed sources from the ClawFeed dashboard (RSS feeds, websites,
+# subreddits, HN definitions, GitHub trending lists) join a category through
+# the `source_categories` join table — they do not need to be listed here.
+#
+# Resolver: `worker/clawfeed_intel/sources.py::build_source_plan`.
+
+profile:
+  timezone: America/Los_Angeles
+  daily_window_hours: 24
+  default_language: en
+
+categories:
+  startup_funding:
+    description: Funding rounds, new funds, seed/Series A+ announcements, notable acquisitions.
+    include:
+      - announced funding rounds
+      - new fund closes
+      - major portfolio company financings
+      - notable acquisitions of AI/dev-tooling companies
+    exclude:
+      - generic opinion posts
+      - old funding rounds recirculated without new information
+    sources:
+      - kind: gdelt
+        query: '(startup OR company) (raised OR funding OR seed OR "series a" OR "series b" OR "series c")'
+      - kind: sec_edgar
+        forms: ["D", "D/A"]
+
+  ai_research:
+    description: New research likely to matter for models, agents, tooling, or infra.
+    include:
+      - foundation model architecture, training, scaling, evaluation
+      - agentic and tool-use research
+      - inference-time techniques (decoding, reasoning, planning)
+      - alignment, safety, interpretability with practical bearing
+    exclude:
+      - incremental benchmark deltas without methodological insight
+    sources:
+      - kind: arxiv
+        categories: ["cs.AI", "cs.LG", "cs.CL", "stat.ML"]
+
+  ai_coding_tools:
+    description: Product, model, pricing, release, or ecosystem moves in AI coding tools.
+    include:
+      - releases or model updates from Codex, Claude Code, Cursor, Continue, Windsurf, Zed, JetBrains AI, Devin-like tools
+      - pricing or terms changes
+      - notable agent frameworks or libraries
+    exclude:
+      - shallow listicles, SEO posts, "X tools to try" content
+    sources:
+      - kind: gdelt
+        query: '("Claude Code" OR Codex OR Cursor OR Windsurf OR Continue.dev OR "AI coding" OR "coding agent")'
+      - kind: github_search
+        query: "topic:ai-coding OR topic:agent OR topic:llm-agent"
+
+  github_traction:
+    description: Repositories gaining real velocity — not merely listed on Trending.
+    include:
+      - repositories with strong star velocity over the last few days
+      - newly released agent / coding-tool / inference / eval frameworks
+    exclude:
+      - repositories whose only signal is appearing on the Trending page
+    sources:
+      - kind: github_trending
+        language: null
+      - kind: github_search
+        query: "topic:llm OR topic:agent OR topic:coding-agent"
+
+dynamic_search:
+  enabled_sources:
+    - raw_cache
+    - gdelt
+    - hn_algolia
+    - reddit
+    - github
+    - sec_edgar
