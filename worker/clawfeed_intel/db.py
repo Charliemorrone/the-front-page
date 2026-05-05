@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -601,3 +601,109 @@ def get_repo_velocity(
         latest_at=latest["observed_at"],
         observation_count=len(rows),
     )
+
+
+# ── item_clusters / cluster_items ─────────────────────────────────────────────
+
+
+CLUSTER_STATUSES: frozenset[str] = frozenset({"pending", "filtered_out", "kept", "summarized"})
+
+
+def iter_run_raw_items(
+    conn: sqlite3.Connection,
+    run_id: int,
+) -> Iterator[sqlite3.Row]:
+    """Yield every raw item linked to *run_id* via ``run_raw_items``.
+
+    Ordered by ``raw_items.id ASC`` so clustering picks a deterministic
+    representative when several items share a cluster key. Includes items
+    first sighted in earlier runs that are reused by this run — the
+    ``run_raw_items`` join table is the run-scoped pool.
+    """
+    rows = conn.execute(
+        """
+        SELECT ri.id, ri.source_type, ri.title, ri.url, ri.canonical_url,
+               ri.content_hash, ri.published_at
+          FROM run_raw_items rri
+          JOIN raw_items ri ON ri.id = rri.raw_item_id
+         WHERE rri.run_id = ?
+         ORDER BY ri.id ASC
+        """,
+        (run_id,),
+    ).fetchall()
+    yield from rows
+
+
+def create_cluster(
+    conn: sqlite3.Connection,
+    *,
+    run_id: int,
+    cluster_key: str,
+    title: str,
+    raw_item_ids: Iterable[int],
+    status: str = "pending",
+    metadata: dict[str, Any] | None = None,
+) -> tuple[int, bool]:
+    """Insert a cluster and attach its members idempotently in one transaction.
+
+    On a ``(run_id, cluster_key)`` conflict the existing cluster is left
+    untouched: ``title``, ``status``, ``metadata`` are not overwritten because
+    the relevance filter (a later stage) mutates ``status`` and we must not
+    clobber its decisions on a clustering re-run. New ``raw_item_ids`` are
+    still appended via ``INSERT OR IGNORE INTO cluster_items`` so a re-run
+    that discovers additional members of an existing cluster still records
+    the linkage.
+
+    Returns:
+        ``(cluster_id, was_new)`` where ``was_new`` is ``True`` iff this call
+        inserted the ``item_clusters`` row.
+
+    Raises:
+        ValueError: if ``cluster_key`` is empty, ``status`` is not a valid
+            cluster status, or ``raw_item_ids`` is empty (a cluster of zero
+            members is meaningless and would only mask an upstream bug).
+        sqlite3.IntegrityError: if ``run_id`` does not reference an existing
+            run, or any ``raw_item_id`` does not exist.
+    """
+    if not cluster_key:
+        raise ValueError("cluster_key is required")
+    if status not in CLUSTER_STATUSES:
+        raise ValueError(
+            f"invalid cluster status {status!r}; must be one of {sorted(CLUSTER_STATUSES)}"
+        )
+    ids = [int(rid) for rid in raw_item_ids]
+    if not ids:
+        raise ValueError("raw_item_ids must contain at least one id")
+
+    metadata_json = _dump_metadata(metadata)
+
+    with transaction(conn):
+        cur = conn.execute(
+            """
+            INSERT INTO item_clusters (run_id, cluster_key, title, status, metadata)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (run_id, cluster_key) DO NOTHING
+            RETURNING id
+            """,
+            (run_id, cluster_key, title, status, metadata_json),
+        )
+        inserted = cur.fetchone()
+        if inserted is not None:
+            cluster_id = int(inserted["id"])
+            was_new = True
+        else:
+            existing = conn.execute(
+                "SELECT id FROM item_clusters WHERE run_id = ? AND cluster_key = ?",
+                (run_id, cluster_key),
+            ).fetchone()
+            if existing is None:
+                raise RuntimeError(f"item_clusters upsert lost row for ({run_id}, {cluster_key!r})")
+            cluster_id = int(existing["id"])
+            was_new = False
+
+        conn.executemany(
+            "INSERT OR IGNORE INTO cluster_items (cluster_id, raw_item_id) VALUES (?, ?)",
+            [(cluster_id, rid) for rid in ids],
+        )
+
+    return cluster_id, was_new

@@ -23,6 +23,7 @@ from ..fetchers import run_fetch_stage
 from ..runs import RunMetadata
 from ..sources import build_source_plan
 from ..timewindow import window_for
+from .cluster import cluster_run
 
 log = logging.getLogger(__name__)
 
@@ -105,7 +106,8 @@ def _drive_run(conn: sqlite3.Connection, run_id: int, metadata: RunMetadata) -> 
 
     db.advance_run_status(conn, run_id, "filtering")
     log.info("run %d: → filtering", run_id)
-    # dedup() / cluster() / relevance_filter()           # TODO: steps 5/7/9
+    metadata.coverage.clusters = cluster_run(conn, run_id)
+    # relevance_filter()                                 # TODO: next milestone
 
     db.advance_run_status(conn, run_id, "summarizing")
     log.info("run %d: → summarizing", run_id)

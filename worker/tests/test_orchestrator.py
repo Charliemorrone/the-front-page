@@ -99,6 +99,83 @@ categories:
     assert all("no fetcher" in s for s in meta["coverage"]["skipped_sources"])
 
 
+def test_run_daily_clusters_fetched_items_into_coverage(temp_db, monkeypatch, tmp_path):
+    """End-to-end: a fetcher that emits two items with the same canonical_url
+    plus one distinct item should produce two Level-1 clusters, surfaced via
+    coverage.clusters in the published digest metadata."""
+    from clawfeed_intel.fetchers import FetchedItem
+
+    yaml_body = """
+categories:
+  scratch:
+    sources:
+      - kind: rss
+        url: https://example.com/feed
+"""
+    _isolate_config(monkeypatch, tmp_path, yaml_body)
+
+    async def stub_fetcher(_conn, _task):
+        return [
+            FetchedItem(
+                source_type="rss",
+                dedup_key="https://example.com/a",
+                title="Alpha (RSS)",
+                url="https://example.com/a",
+                canonical_url="https://example.com/a",
+                content="alpha body",
+                content_hash="hash-a",
+            ),
+            FetchedItem(
+                source_type="rss",
+                dedup_key="https://example.com/a?utm=x",
+                title="Alpha (also RSS)",
+                url="https://example.com/a?utm=x",
+                canonical_url="https://example.com/a",
+                content="alpha body",
+                content_hash="hash-a",
+            ),
+            FetchedItem(
+                source_type="rss",
+                dedup_key="https://example.com/b",
+                title="Beta",
+                url="https://example.com/b",
+                canonical_url="https://example.com/b",
+                content="beta body",
+                content_hash="hash-b",
+            ),
+        ]
+
+    monkeypatch.setattr(
+        "clawfeed_intel.fetchers.runner.FETCHER_REGISTRY",
+        {"rss": stub_fetcher},
+    )
+
+    with closing(worker_db.connect(temp_db)) as conn:
+        digest_id = run_daily("24h", conn=conn)
+
+        meta = json.loads(
+            conn.execute("SELECT metadata FROM digests WHERE id = ?", (digest_id,)).fetchone()[
+                "metadata"
+            ]
+        )
+        assert meta["coverage"]["raw_items"] == 3
+        assert meta["coverage"]["clusters"] == 2
+        assert meta["coverage"]["kept_clusters"] == 0  # relevance filter not yet wired
+
+        run_row = conn.execute(
+            "SELECT id FROM intel_runs WHERE digest_id = ?", (digest_id,)
+        ).fetchone()
+        clusters = conn.execute(
+            "SELECT cluster_key, status FROM item_clusters WHERE run_id = ? ORDER BY cluster_key",
+            (run_row["id"],),
+        ).fetchall()
+        assert [c["cluster_key"] for c in clusters] == [
+            "https://example.com/a",
+            "https://example.com/b",
+        ]
+        assert all(c["status"] == "pending" for c in clusters)
+
+
 def test_run_daily_records_resolver_warning_in_coverage(temp_db, monkeypatch, tmp_path):
     """A missing config produces a PlanWarning that surfaces as
     coverage.plan_warnings — the brief should be able to explain why the
