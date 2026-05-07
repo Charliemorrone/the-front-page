@@ -707,3 +707,77 @@ def create_cluster(
         )
 
     return cluster_id, was_new
+
+
+# ── llm_calls ─────────────────────────────────────────────────────────────────
+
+
+LLM_CALL_STATUSES: frozenset[str] = frozenset({"succeeded", "failed"})
+
+
+def record_llm_call(
+    conn: sqlite3.Connection,
+    *,
+    stage: str,
+    provider: str,
+    model: str,
+    status: str,
+    latency_ms: int,
+    run_id: int | None = None,
+    prompt_version: str | None = None,
+    input_hash: str | None = None,
+    output_hash: str | None = None,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    error: str | None = None,
+) -> int:
+    """Append one row to ``llm_calls`` and return its id.
+
+    ``input_hash`` / ``output_hash`` are SHA-256 hex digests over the canonical
+    message list and the response content, respectively. Full prompt and
+    response text are intentionally NOT stored: the row carries enough to
+    reconstruct context (prompt_version + run metadata) and storing the
+    rest would bloat the DB with sensitive content recoverable elsewhere.
+
+    On ``status='failed'``, ``error`` should be a short reason; ``output_hash``
+    and token counts may be zero/None. The schema's CHECK constraint enforces
+    valid statuses; we validate at the boundary too so a typo raises in
+    Python before round-tripping to SQLite.
+    """
+    if status not in LLM_CALL_STATUSES:
+        raise ValueError(
+            f"invalid llm_calls status {status!r}; must be one of {sorted(LLM_CALL_STATUSES)}"
+        )
+    if not stage:
+        raise ValueError("stage is required")
+    if not provider:
+        raise ValueError("provider is required")
+    if not model:
+        raise ValueError("model is required")
+
+    with transaction(conn):
+        cur = conn.execute(
+            """
+            INSERT INTO llm_calls (
+                run_id, stage, provider, model, prompt_version,
+                input_hash, output_hash, latency_ms,
+                prompt_tokens, completion_tokens, status, error
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                stage,
+                provider,
+                model,
+                prompt_version,
+                input_hash,
+                output_hash,
+                int(latency_ms),
+                int(prompt_tokens),
+                int(completion_tokens),
+                status,
+                error,
+            ),
+        )
+        return int(cur.lastrowid or 0)

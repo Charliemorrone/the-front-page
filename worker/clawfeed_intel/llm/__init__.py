@@ -10,7 +10,7 @@ Step 8b adds retries, JSON-schema validation, repair fallback, and DB
 logging. Step 11 adds the openclaw provider for final composition.
 """
 
-from .client import CallResult, LLMClient
+from .client import CallResult, LLMClient, LLMSchemaError, RetryConfig
 from .routing import (
     DEFAULT_CONFIG_PATH,
     ProvidersConfig,
@@ -24,7 +24,9 @@ __all__ = [
     "CallResult",
     "DEFAULT_CONFIG_PATH",
     "LLMClient",
+    "LLMSchemaError",
     "ProvidersConfig",
+    "RetryConfig",
     "RoutingConfig",
     "StageConfig",
     "VmlxProviderConfig",
