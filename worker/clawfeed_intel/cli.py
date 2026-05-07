@@ -4,19 +4,22 @@ Phase 1 surface:
     clawfeed-intel doctor             health-check vMLX, OpenClaw, DB
     clawfeed-intel run daily          run a daily brief (24h window)
 
-Implementation lands incrementally; subcommands print a clear "not implemented"
-message until their pipeline stage is wired up.
+`doctor` is the canonical "is the system runnable" probe. It exits non-zero
+if any check fails so a cron job can short-circuit cleanly before kicking
+off a daily run.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import os
 import sys
 from contextlib import closing
 
-from . import __version__, db
+from . import __version__, db, doctor
+from .llm import load_routing
 from .paths import DB_PATH, REPO_ROOT
 from .pipeline.orchestrator import run_daily
 
@@ -46,11 +49,18 @@ def _configure_logging() -> None:
 
 
 def cmd_doctor(_args: argparse.Namespace) -> int:
+    """Probe vMLX + DB. Exit 0 if everything's reachable, 1 otherwise.
+
+    The exit code is the contract: cron uses it to decide whether to run
+    the daily brief. A non-zero return means the system isn't shippable —
+    fix vMLX, then retry.
+    """
     print(f"clawfeed-intel {__version__}")
     print(f"  repo:     {REPO_ROOT}")
     print(f"  db:       {DB_PATH}")
     print(f"            exists={DB_PATH.exists()}")
 
+    db_ok = True
     if DB_PATH.exists():
         try:
             with closing(db.connect()) as conn:
@@ -63,12 +73,39 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
                 found = row["n"] if row else 0
                 marker = "ok" if found == len(_INTEL_TABLES) else "MISSING"
                 print(f"            intel tables: {found}/{len(_INTEL_TABLES)} [{marker}]")
+                if found != len(_INTEL_TABLES):
+                    db_ok = False
         except Exception as exc:
             print(f"            db open failed: {exc}")
+            db_ok = False
+    else:
+        print("            db missing — run migrations before first daily brief")
+        db_ok = False
 
-    print("  vmlx:     not implemented")
-    print("  openclaw: not implemented")
-    return 0
+    print("  vmlx:")
+    try:
+        routing = load_routing()
+    except Exception as exc:
+        print(f"    [FAIL] routing config: {type(exc).__name__}: {exc}")
+        print("  openclaw: not implemented")  # step 11
+        return 1
+
+    try:
+        results = asyncio.run(doctor.run_doctor_probes(routing))
+    except Exception as exc:
+        print(f"    [FAIL] probes raised unexpectedly: {type(exc).__name__}: {exc}")
+        print("  openclaw: not implemented")
+        return 1
+
+    vmlx_ok = True
+    for result in results:
+        marker = " ok " if result.ok else "FAIL"
+        print(f"    [{marker}] {result.name:24s} {result.latency_ms:>5d}ms — {result.detail}")
+        if not result.ok:
+            vmlx_ok = False
+
+    print("  openclaw: not implemented")  # step 11
+    return 0 if (db_ok and vmlx_ok) else 1
 
 
 def cmd_run_daily(args: argparse.Namespace) -> int:
