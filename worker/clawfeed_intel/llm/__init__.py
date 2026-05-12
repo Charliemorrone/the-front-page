@@ -19,6 +19,7 @@ from .routing import (
     VmlxProviderConfig,
     load_routing,
 )
+from .schemas import RelevanceBatchResponse, RelevanceVerdict
 
 __all__ = [
     "CallResult",
@@ -26,6 +27,8 @@ __all__ = [
     "LLMClient",
     "LLMSchemaError",
     "ProvidersConfig",
+    "RelevanceBatchResponse",
+    "RelevanceVerdict",
     "RetryConfig",
     "RoutingConfig",
     "StageConfig",

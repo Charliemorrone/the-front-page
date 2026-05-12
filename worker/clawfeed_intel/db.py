@@ -709,6 +709,61 @@ def create_cluster(
     return cluster_id, was_new
 
 
+VERDICT_STATUSES: frozenset[str] = frozenset({"kept", "filtered_out"})
+
+
+def update_cluster_verdict(
+    conn: sqlite3.Connection,
+    *,
+    cluster_id: int,
+    status: str,
+    relevance_score: float,
+    category: str,
+    event_type: str | None,
+    filter_reason: str,
+) -> None:
+    """Apply one relevance verdict to an existing cluster row.
+
+    Promotes ``status`` from ``'pending'`` to ``'kept'`` or
+    ``'filtered_out'`` and records the LLM's judgement fields. Called
+    by the relevance filter (step 9b) once per cluster in a batch. The
+    write is idempotent — re-applying the same verdict is a clean
+    no-op modulo the timestamps in adjacent rows.
+
+    Restricting ``status`` to the verdict set here (not the broader
+    ``CLUSTER_STATUSES``) is load-bearing: the relevance filter must
+    not push a cluster back to ``'pending'`` (would invalidate prior
+    verdicts on a re-run) or directly to ``'summarized'`` (that
+    transition is owned by the cluster-summary stage).
+
+    Raises:
+        ValueError: ``status`` not in :data:`VERDICT_STATUSES`.
+        LookupError: ``cluster_id`` does not reference an existing
+            cluster row. Surfaces lost rows loudly rather than masking
+            them as a silent no-op.
+    """
+    if status not in VERDICT_STATUSES:
+        raise ValueError(
+            f"invalid verdict status {status!r}; must be one of {sorted(VERDICT_STATUSES)}"
+        )
+
+    with transaction(conn):
+        cur = conn.execute(
+            """
+            UPDATE item_clusters
+               SET status = ?,
+                   relevance_score = ?,
+                   category = ?,
+                   event_type = ?,
+                   filter_reason = ?
+             WHERE id = ?
+            """,
+            (status, relevance_score, category, event_type, filter_reason, cluster_id),
+        )
+        if cur.rowcount == 0:
+            raise LookupError(f"item_clusters row {cluster_id} not found")
+
+
 # ── llm_calls ─────────────────────────────────────────────────────────────────
 
 
