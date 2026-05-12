@@ -712,6 +712,57 @@ def create_cluster(
 VERDICT_STATUSES: frozenset[str] = frozenset({"kept", "filtered_out"})
 
 
+def iter_pending_clusters_with_members(
+    conn: sqlite3.Connection,
+    run_id: int,
+) -> Iterator[tuple[int, str, list[sqlite3.Row]]]:
+    """Yield ``(cluster_id, title, members)`` for each pending cluster.
+
+    Members are :class:`sqlite3.Row` objects exposing ``canonical_url``
+    and ``excerpt``, sorted by ``raw_items.id ASC`` — the first member
+    is the cluster's representative, matching the clustering layer's
+    smallest-id tie-break rule. Clusters with no surviving members
+    (would shouldn't happen, since ``create_cluster`` rejects empty
+    member lists) are skipped silently rather than yielding an
+    obviously-broken row.
+
+    The query is one round-trip; grouping happens in Python. ~700
+    clusters with ~1-2 members each is well within the size at which
+    that's the right shape.
+    """
+    rows = conn.execute(
+        """
+        SELECT ic.id        AS cluster_id,
+               ic.title     AS title,
+               ri.id        AS raw_item_id,
+               ri.canonical_url AS canonical_url,
+               ri.excerpt   AS excerpt
+          FROM item_clusters ic
+          JOIN cluster_items ci ON ci.cluster_id = ic.id
+          JOIN raw_items     ri ON ri.id = ci.raw_item_id
+         WHERE ic.run_id = ?
+           AND ic.status = 'pending'
+         ORDER BY ic.id ASC, ri.id ASC
+        """,
+        (run_id,),
+    ).fetchall()
+
+    if not rows:
+        return
+
+    current_id = rows[0]["cluster_id"]
+    current_title = rows[0]["title"] or ""
+    current_members: list[sqlite3.Row] = []
+    for row in rows:
+        if row["cluster_id"] != current_id:
+            yield current_id, current_title, current_members
+            current_id = row["cluster_id"]
+            current_title = row["title"] or ""
+            current_members = []
+        current_members.append(row)
+    yield current_id, current_title, current_members
+
+
 def update_cluster_verdict(
     conn: sqlite3.Connection,
     *,

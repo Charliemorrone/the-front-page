@@ -169,8 +169,22 @@ class LLMClient:
         *,
         response_schema: type[BaseModel] | None = None,
         prompt_version: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> CallResult:
         """Dispatch one chat-completion against the configured stage.
+
+        ``temperature`` is forwarded into the OpenAI body when supplied;
+        when omitted the provider's default sampling temperature is used
+        (vMLX defaults to ~0.7 for Qwen-style models). Structured-output
+        stages typically want ``0.0``–``0.1`` to keep JSON well-formed
+        under load.
+
+        ``max_tokens`` is similarly forwarded when supplied. Local MLX
+        servers default to ~1024 completion tokens which is too small
+        for batched structured outputs (e.g. a 12-cluster relevance
+        batch returns ~12-15 tokens × verdict-shape ≈ over 1024). Pin
+        a higher value at the call site when emitting JSON arrays.
 
         Raises:
             KeyError: stage not in the routing config.
@@ -188,9 +202,17 @@ class LLMClient:
         wall_start = time.perf_counter()
 
         try:
-            content, model = await self._call_with_retries(stage_config, messages, metrics)
+            content, model = await self._call_with_retries(
+                stage_config, messages, metrics, temperature, max_tokens
+            )
             parsed, content_out = await self._validate_and_repair(
-                stage_config, messages, content, response_schema, metrics
+                stage_config,
+                messages,
+                content,
+                response_schema,
+                metrics,
+                temperature,
+                max_tokens,
             )
         except BaseException as exc:
             wall_ms = int((time.perf_counter() - wall_start) * 1000)
@@ -234,6 +256,8 @@ class LLMClient:
         stage_config: StageConfig,
         messages: list[dict[str, str]],
         metrics: _Metrics,
+        temperature: float | None,
+        max_tokens: int | None,
     ) -> tuple[str, str]:
         """Make one HTTP call, retrying transient failures.
 
@@ -256,7 +280,9 @@ class LLMClient:
         payload: dict[str, Any] = {}
         async for attempt in retrying:
             with attempt:
-                payload = await self._http_call_once(stage_config, messages)
+                payload = await self._http_call_once(
+                    stage_config, messages, temperature, max_tokens
+                )
 
         metrics.add_usage(payload)
         result = _parse_response(payload, fallback_model=stage_config.model)
@@ -269,6 +295,8 @@ class LLMClient:
         content: str,
         response_schema: type[BaseModel] | None,
         metrics: _Metrics,
+        temperature: float | None,
+        max_tokens: int | None,
     ) -> tuple[BaseModel | None, str]:
         """Validate ``content`` against the optional schema; repair once.
 
@@ -295,7 +323,7 @@ class LLMClient:
                 {"role": "user", "content": _REPAIR_PROMPT},
             ]
             repaired_content, _ = await self._call_with_retries(
-                stage_config, repair_messages, metrics
+                stage_config, repair_messages, metrics, temperature, max_tokens
             )
             try:
                 return (
@@ -313,10 +341,18 @@ class LLMClient:
         self,
         stage_config: StageConfig,
         messages: list[dict[str, str]],
+        temperature: float | None,
+        max_tokens: int | None,
     ) -> dict[str, Any]:
         """One HTTP attempt. Raises on 4xx/5xx; retry handled by caller."""
         url = self._build_url(stage_config)
-        body = {"model": stage_config.model, "messages": messages}
+        body: dict[str, Any] = {"model": stage_config.model, "messages": messages}
+        if temperature is not None:
+            # Forward only when caller pinned a value; providers' defaults
+            # vary, and we don't want this client to impose a global default.
+            body["temperature"] = temperature
+        if max_tokens is not None:
+            body["max_tokens"] = max_tokens
 
         async with httpx.AsyncClient(
             transport=self._transport,

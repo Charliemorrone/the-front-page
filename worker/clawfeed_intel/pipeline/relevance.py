@@ -6,21 +6,18 @@ to ``'filtered_out'``. Batched LLM call per ``StageConfig.batch_size``
 (default 12 per the architecture doc). The model chooses categories
 from the editorial list in :file:`config/intel-sources.yaml`.
 
-This module ships the **pure layer** (step 9a):
+Two-layer split, mirroring the fetcher and clustering modules:
 
-- :class:`RelevanceCluster` — the input shape the orchestrator hands
-  the pure helper after joining ``item_clusters → cluster_items →
-  raw_items``.
-- :func:`build_relevance_messages` — deterministic OpenAI-style
-  messages list. System message lays out the categories and the
-  JSON contract; user message enumerates the batch in order.
-- :func:`parse_relevance_verdicts` — unpacks the pydantic-validated
-  :class:`RelevanceBatchResponse` and asserts the verdict count
-  matches the input batch (positional verdict assignment is meaningless
-  otherwise — fail loud rather than mis-apply).
-
-The async orchestration layer (``filter_clusters``) and the
-``Coverage.failed_filter_batches`` counter land in step 9b.
+- **Pure layer.** :class:`RelevanceCluster`,
+  :func:`build_relevance_messages`, :func:`parse_relevance_verdicts`,
+  and :data:`PROMPT_VERSION`. Fixture-testable without HTTP / DB / LLM.
+- **Async orchestration.** :func:`filter_clusters` loads pending
+  clusters, batches them, calls :meth:`LLMClient.chat_completion` with
+  the :class:`RelevanceBatchResponse` schema, applies verdicts via
+  :func:`db.update_cluster_verdict`. Per-batch LLM failures degrade
+  coverage rather than crashing the run — the architecture-doc
+  "failed sources degrade coverage; they do not fail the run" rule
+  extended to LLM stages.
 
 The architecture-doc rule the prompt is designed around: **this stage
 must be allowed to keep many items. It is not a top-N selector.** If
@@ -30,12 +27,34 @@ wrong, not the threshold.
 
 from __future__ import annotations
 
+import logging
+import sqlite3
 from dataclasses import dataclass, field
 
+from .. import db
+from ..llm import LLMClient
 from ..llm.schemas import RelevanceBatchResponse, RelevanceVerdict
+from ..runs import Coverage
 from ..sources import CategoryPlan
 
+log = logging.getLogger(__name__)
+
 PROMPT_VERSION = "relevance.v1"
+
+# Structured outputs need a low temperature to keep JSON well-formed under
+# load. Pinned at the call site (not in routing YAML) because it's a
+# property of the *prompt* — the relevance prompt is JSON-mode; a future
+# free-form planner prompt against the same model wouldn't want this.
+_RELEVANCE_TEMPERATURE = 0.1
+
+# Local MLX servers default to ~1024 completion tokens, which truncates
+# batched verdict responses mid-JSON. A 12-cluster batch with verbose
+# `reason` fields can run ~200 tokens/verdict — budget generously to
+# leave headroom and avoid the schema-repair retry path under normal
+# load. ~250 tokens/verdict × 12 verdicts = 3000, plus envelope: 4096
+# gives comfortable margin without imposing a memory burden on the
+# server.
+_RELEVANCE_MAX_TOKENS_PER_VERDICT = 320
 
 
 # ── Input shape ───────────────────────────────────────────────────────────────
@@ -246,9 +265,172 @@ def parse_relevance_verdicts(
     return verdicts
 
 
+# ── Async orchestration ──────────────────────────────────────────────────────
+
+
+async def filter_clusters(
+    conn: sqlite3.Connection,
+    run_id: int,
+    llm_client: LLMClient,
+    coverage: Coverage,
+    *,
+    categories: list[CategoryPlan],
+    batch_size: int = 12,
+    prompt_version: str = PROMPT_VERSION,
+) -> int:
+    """Apply relevance verdicts to every pending cluster in *run_id*.
+
+    Walks pending clusters in id order, batches by *batch_size*, and
+    judges each batch via one :meth:`LLMClient.chat_completion` call.
+    Verdicts are applied immediately so a mid-stage crash leaves a
+    coherent partial result rather than an all-or-nothing rollback.
+
+    Per-batch failure model (the architecture-doc "failed sources
+    degrade coverage" rule extended to LLM stages): when an LLM call
+    raises after retries / repair, the batch's clusters stay at
+    ``status='pending'``, :meth:`Coverage.record_failed_filter_batch`
+    increments, and the run continues. Those clusters won't reach
+    summary or compose — they simply don't make it into today's brief.
+
+    Per-cluster failure model: if applying a verdict raises (concurrent
+    delete, schema drift, etc.), the cluster is skipped with a logged
+    warning. Sibling clusters in the batch are unaffected.
+
+    Returns the number of clusters promoted to ``'kept'``.
+    """
+    clusters = _load_pending_clusters(conn, run_id)
+    if not clusters:
+        return 0
+
+    kept = 0
+    for batch in _batched(clusters, batch_size):
+        try:
+            verdicts = await _judge_batch(
+                llm_client, batch, categories, prompt_version=prompt_version
+            )
+        except Exception as exc:
+            log.warning(
+                "run %d: relevance batch failed (%d clusters left pending): %s",
+                run_id,
+                len(batch),
+                exc,
+            )
+            coverage.record_failed_filter_batch()
+            continue
+
+        kept += _apply_verdicts(conn, batch, verdicts)
+
+    return kept
+
+
+async def _judge_batch(
+    llm_client: LLMClient,
+    batch: list[RelevanceCluster],
+    categories: list[CategoryPlan],
+    *,
+    prompt_version: str,
+) -> list[RelevanceVerdict]:
+    """Run one batch through the LLM and unpack the verdict list."""
+    messages = build_relevance_messages(batch, categories)
+    # Size the completion budget to the batch — small batches don't need
+    # the full ceiling; large batches absolutely do.
+    max_tokens = _RELEVANCE_MAX_TOKENS_PER_VERDICT * len(batch) + 256
+    result = await llm_client.chat_completion(
+        stage="relevance_filter",
+        messages=messages,
+        response_schema=RelevanceBatchResponse,
+        prompt_version=prompt_version,
+        temperature=_RELEVANCE_TEMPERATURE,
+        max_tokens=max_tokens,
+    )
+    # ``response_schema`` populates ``parsed`` — guaranteed non-None
+    # here, but a defensive cast keeps the type-checker happy.
+    parsed = result.parsed
+    if not isinstance(parsed, RelevanceBatchResponse):
+        raise RuntimeError(
+            f"LLMClient returned parsed={type(parsed).__name__}; expected RelevanceBatchResponse"
+        )
+    return parse_relevance_verdicts(parsed, expected_count=len(batch))
+
+
+def _apply_verdicts(
+    conn: sqlite3.Connection,
+    batch: list[RelevanceCluster],
+    verdicts: list[RelevanceVerdict],
+) -> int:
+    """Write verdicts back to ``item_clusters``; return kept count."""
+    kept = 0
+    for cluster, verdict in zip(batch, verdicts, strict=True):
+        status = "kept" if verdict.keep else "filtered_out"
+        try:
+            db.update_cluster_verdict(
+                conn,
+                cluster_id=cluster.cluster_id,
+                status=status,
+                relevance_score=verdict.score,
+                category=verdict.category,
+                event_type=verdict.event_type,
+                filter_reason=verdict.reason,
+            )
+        except Exception as exc:
+            log.warning(
+                "failed to apply verdict to cluster %d: %s",
+                cluster.cluster_id,
+                exc,
+            )
+            continue
+        if verdict.keep:
+            kept += 1
+    return kept
+
+
+def _load_pending_clusters(
+    conn: sqlite3.Connection,
+    run_id: int,
+) -> list[RelevanceCluster]:
+    """Hydrate :class:`RelevanceCluster` instances for every pending cluster.
+
+    The smallest-id member is the representative: its canonical_url and
+    excerpt seed the cluster's prompt fields. All member canonical URLs
+    flow into ``member_urls`` so L2/L3 folds can be inspected as
+    cross-source evidence by the LLM.
+    """
+    out: list[RelevanceCluster] = []
+    for cluster_id, title, members in db.iter_pending_clusters_with_members(conn, run_id):
+        if not members:
+            continue
+        representative = members[0]
+        member_urls = tuple((m["canonical_url"] or "") for m in members if m["canonical_url"])
+        out.append(
+            RelevanceCluster(
+                cluster_id=cluster_id,
+                title=title,
+                canonical_url=representative["canonical_url"] or "",
+                excerpt=representative["excerpt"] or "",
+                member_urls=member_urls,
+            )
+        )
+    return out
+
+
+def _batched(items: list[RelevanceCluster], size: int) -> list[list[RelevanceCluster]]:
+    """Split *items* into contiguous batches of at most *size* elements.
+
+    Done inline rather than via :func:`itertools.batched` for Python
+    3.11 compatibility — the project pins 3.12 but the worker pyproject
+    declares ``requires-python = ">=3.12"`` only because the type
+    annotations use 3.10+ syntax, and the rest of the codebase avoids
+    3.12-only stdlib niceties.
+    """
+    if size <= 0:
+        raise ValueError(f"batch size must be positive, got {size}")
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
 __all__ = (
     "PROMPT_VERSION",
     "RelevanceCluster",
     "build_relevance_messages",
+    "filter_clusters",
     "parse_relevance_verdicts",
 )

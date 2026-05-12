@@ -20,10 +20,12 @@ import sqlite3
 
 from .. import db
 from ..fetchers import run_fetch_stage
+from ..llm import LLMClient, RoutingConfig, load_routing
 from ..runs import RunMetadata
 from ..sources import build_source_plan
 from ..timewindow import window_for
 from .cluster import cluster_run
+from .relevance import filter_clusters
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +44,7 @@ prove that runs walk through every state and publish a real digest._
 - Event clusters: {clusters}
 - Kept clusters: {kept_clusters}
 - Failed sources: {failed_sources}
+- Failed filter batches: {failed_filter_batches}
 
 _Run id: {run_id}. Window: {window_start} → {window_end}._
 """
@@ -107,7 +110,27 @@ def _drive_run(conn: sqlite3.Connection, run_id: int, metadata: RunMetadata) -> 
     db.advance_run_status(conn, run_id, "filtering")
     log.info("run %d: → filtering", run_id)
     metadata.coverage.clusters = cluster_run(conn, run_id)
-    # relevance_filter()                                 # TODO: next milestone
+
+    routing = load_routing()
+    llm_client = _build_llm_client(routing, conn=conn, run_id=run_id)
+    stage_config = routing.resolve("relevance_filter")
+    metadata.coverage.kept_clusters = asyncio.run(
+        filter_clusters(
+            conn,
+            run_id,
+            llm_client,
+            metadata.coverage,
+            categories=list(plan.categories),
+            batch_size=stage_config.batch_size or 12,
+        )
+    )
+    metadata.local_models["filter"] = stage_config.model
+    log.info(
+        "run %d: filtered (%d kept, %d failed batches)",
+        run_id,
+        metadata.coverage.kept_clusters,
+        metadata.coverage.failed_filter_batches,
+    )
 
     db.advance_run_status(conn, run_id, "summarizing")
     log.info("run %d: → summarizing", run_id)
@@ -129,6 +152,21 @@ def _drive_run(conn: sqlite3.Connection, run_id: int, metadata: RunMetadata) -> 
     return digest_id
 
 
+def _build_llm_client(
+    routing: RoutingConfig,
+    *,
+    conn: sqlite3.Connection,
+    run_id: int,
+) -> LLMClient:
+    """Construct the per-run LLM client.
+
+    Pulled into a thin helper so tests can monkeypatch this name to
+    inject a client backed by :class:`httpx.MockTransport` without
+    needing to refactor :func:`_drive_run`'s control flow.
+    """
+    return LLMClient(routing, conn=conn, run_id=run_id)
+
+
 def _compose_stub(metadata: RunMetadata) -> str:
     coverage = metadata.coverage
     return _STUB_BRIEF_TEMPLATE.format(
@@ -142,4 +180,5 @@ def _compose_stub(metadata: RunMetadata) -> str:
         clusters=coverage.clusters,
         kept_clusters=coverage.kept_clusters,
         failed_sources=", ".join(coverage.failed_sources) or "none",
+        failed_filter_batches=coverage.failed_filter_batches,
     )

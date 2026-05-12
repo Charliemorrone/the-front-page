@@ -26,6 +26,7 @@ class Coverage:
     failed_sources: list[str] = field(default_factory=list)
     skipped_sources: list[str] = field(default_factory=list)
     plan_warnings: list[str] = field(default_factory=list)
+    failed_filter_batches: int = 0
 
     def record_success(self, source_id: str, items: int) -> None:
         self.sources_attempted += 1
@@ -52,6 +53,16 @@ class Coverage:
     def record_plan_warning(self, message: str) -> None:
         if message not in self.plan_warnings:
             self.plan_warnings.append(message)
+
+    def record_failed_filter_batch(self) -> None:
+        """One relevance-filter batch failed; clusters left at ``pending``.
+
+        Increments a counter rather than a list because a batch carries no
+        natural identifier worth preserving — the cluster ids in the batch
+        already encode "didn't get a verdict" by their unchanged
+        ``status='pending'``.
+        """
+        self.failed_filter_batches += 1
 
 
 @dataclass

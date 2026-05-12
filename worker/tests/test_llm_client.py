@@ -343,6 +343,94 @@ async def test_chat_completion_body_uses_stage_model(
 
     assert captured["body"]["model"] == "mlx-community/Qwen3-8B-4bit"
     assert captured["body"]["messages"] == [{"role": "user", "content": "hi"}]
+    # No temperature unless the caller asks for one — leave the provider's
+    # default in place by omitting the field entirely.
+    assert "temperature" not in captured["body"]
+
+
+async def test_chat_completion_forwards_temperature_when_set(
+    routing: RoutingConfig, no_retry: RetryConfig
+) -> None:
+    """Structured-output prompts (relevance filter, cluster summary) pin a
+    low temperature to keep JSON well-formed. Verify the value lands in the
+    request body verbatim.
+    """
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.read().decode())
+        return httpx.Response(200, json=_ok_response(content="ok", model="m"))
+
+    client = LLMClient(routing, transport=httpx.MockTransport(handler), retry_config=no_retry)
+    await client.chat_completion(
+        "source_planning",
+        [{"role": "user", "content": "hi"}],
+        temperature=0.1,
+    )
+
+    assert captured["body"]["temperature"] == 0.1
+
+
+async def test_chat_completion_temperature_zero_is_forwarded(
+    routing: RoutingConfig, no_retry: RetryConfig
+) -> None:
+    """``temperature=0.0`` is a valid pin (deterministic decoding) and must
+    not be confused with the ``None`` default.
+    """
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.read().decode())
+        return httpx.Response(200, json=_ok_response(content="ok", model="m"))
+
+    client = LLMClient(routing, transport=httpx.MockTransport(handler), retry_config=no_retry)
+    await client.chat_completion(
+        "source_planning",
+        [{"role": "user", "content": "hi"}],
+        temperature=0.0,
+    )
+
+    assert captured["body"]["temperature"] == 0.0
+
+
+async def test_chat_completion_forwards_max_tokens_when_set(
+    routing: RoutingConfig, no_retry: RetryConfig
+) -> None:
+    """Batched-JSON stages must size the response budget to the batch.
+    Local MLX defaults to ~1024 tokens which truncates verdict arrays.
+    """
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.read().decode())
+        return httpx.Response(200, json=_ok_response(content="ok", model="m"))
+
+    client = LLMClient(routing, transport=httpx.MockTransport(handler), retry_config=no_retry)
+    await client.chat_completion(
+        "source_planning",
+        [{"role": "user", "content": "hi"}],
+        max_tokens=4096,
+    )
+
+    assert captured["body"]["max_tokens"] == 4096
+
+
+async def test_chat_completion_max_tokens_omitted_when_unset(
+    routing: RoutingConfig, no_retry: RetryConfig
+) -> None:
+    """The default must omit max_tokens entirely — providers' defaults
+    vary and we don't want to impose a global ceiling from the client.
+    """
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.read().decode())
+        return httpx.Response(200, json=_ok_response(content="ok", model="m"))
+
+    client = LLMClient(routing, transport=httpx.MockTransport(handler), retry_config=no_retry)
+    await client.chat_completion("source_planning", [{"role": "user", "content": "hi"}])
+
+    assert "max_tokens" not in captured["body"]
 
 
 async def test_chat_completion_routes_per_stage(
