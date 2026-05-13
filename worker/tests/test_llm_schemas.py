@@ -45,15 +45,37 @@ def test_verdict_accepts_minimum_fields() -> None:
     verdict = RelevanceVerdict.model_validate(
         {
             "keep": False,
-            "category": "ai_research",
             "score": 0.1,
-            "reason": "Off-topic preprint.",
         }
     )
+    assert verdict.category is None
     assert verdict.event_type is None
+    assert verdict.reason is None
     assert verdict.entities == []
     assert verdict.evidence_urls == []
     assert verdict.uncertainty is None
+
+
+def test_verdict_accepts_null_category_and_reason() -> None:
+    """Local models reliably emit ``null`` for category and reason on
+    rejected verdicts. Caught live during the first end-to-end smoke
+    against Qwen3.5-27B-4bit (run 1 of the 2026-05-12 smoke). Strict
+    requirement would force the repair retry on every batch with any
+    rejection and still likely fail. The schema accepts ``None``; the
+    DB columns are nullable.
+    """
+    verdict = RelevanceVerdict.model_validate(
+        {
+            "keep": False,
+            "category": None,
+            "score": 0.05,
+            "event_type": None,
+            "reason": None,
+        }
+    )
+    assert verdict.keep is False
+    assert verdict.category is None
+    assert verdict.reason is None
 
 
 def test_verdict_score_lower_bound() -> None:
@@ -92,9 +114,12 @@ def test_verdict_requires_keep() -> None:
         RelevanceVerdict.model_validate(payload)
 
 
-def test_verdict_requires_reason() -> None:
+def test_verdict_requires_score() -> None:
+    """``score`` stays required — it's how downstream stages rank borderline
+    verdicts. Unlike ``reason``, the model reliably emits it.
+    """
     payload = _valid_verdict_payload()
-    del payload["reason"]
+    del payload["score"]
     with pytest.raises(ValidationError):
         RelevanceVerdict.model_validate(payload)
 

@@ -29,13 +29,22 @@ class RelevanceVerdict(_SchemaBase):
     Relevance Filter" section. The LLM emits one of these per cluster
     in the batch, in the same order it received them — verdict
     assignment is positional, so order preservation is load-bearing.
+
+    ``category`` and ``reason`` are intentionally permissive
+    (``str | None``): local models reliably emit ``null`` for these
+    fields on rejected verdicts (no category to assign, no narrative
+    needed) — discovered live during the first end-to-end smoke run
+    against Qwen3.5-27B-4bit. Strict requirement would force the
+    schema-repair retry on every batch with any rejection and still
+    likely fail; we'd rather accept the verdict and surface the
+    judgement than reject the whole batch.
     """
 
     keep: bool
-    category: str
+    category: str | None = None
     score: float = Field(ge=0.0, le=1.0)
     event_type: str | None = None
-    reason: str
+    reason: str | None = None
     entities: list[str] = Field(default_factory=list)
     evidence_urls: list[str] = Field(default_factory=list)
     uncertainty: float | None = Field(default=None, ge=0.0, le=1.0)

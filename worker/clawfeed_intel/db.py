@@ -769,9 +769,9 @@ def update_cluster_verdict(
     cluster_id: int,
     status: str,
     relevance_score: float,
-    category: str,
+    category: str | None,
     event_type: str | None,
-    filter_reason: str,
+    filter_reason: str | None,
 ) -> None:
     """Apply one relevance verdict to an existing cluster row.
 
@@ -786,6 +786,11 @@ def update_cluster_verdict(
     not push a cluster back to ``'pending'`` (would invalidate prior
     verdicts on a re-run) or directly to ``'summarized'`` (that
     transition is owned by the cluster-summary stage).
+
+    ``category`` and ``filter_reason`` accept ``None`` because local
+    models reliably emit ``null`` for both fields on rejected
+    verdicts — the schema is permissive there and so is this helper.
+    The corresponding columns are nullable in the migration.
 
     Raises:
         ValueError: ``status`` not in :data:`VERDICT_STATUSES`.

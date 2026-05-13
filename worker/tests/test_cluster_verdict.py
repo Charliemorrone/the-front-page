@@ -106,6 +106,33 @@ def test_filtered_out_verdict_writes_all_fields(temp_db) -> None:
         assert row["event_type"] is None
 
 
+def test_filtered_out_verdict_accepts_null_category_and_reason(temp_db) -> None:
+    """Local models reliably emit ``null`` for category and reason on
+    rejected verdicts (caught during the first live-vMLX smoke). The DB
+    columns are nullable; the helper must accept ``None`` without raising.
+    """
+    with closing(worker_db.connect(temp_db)) as conn:
+        cluster_id = _seed_pending_cluster(conn)
+
+        worker_db.update_cluster_verdict(
+            conn,
+            cluster_id=cluster_id,
+            status="filtered_out",
+            relevance_score=0.05,
+            category=None,
+            event_type=None,
+            filter_reason=None,
+        )
+
+        row = conn.execute(
+            "SELECT status, category, filter_reason FROM item_clusters WHERE id = ?",
+            (cluster_id,),
+        ).fetchone()
+        assert row["status"] == "filtered_out"
+        assert row["category"] is None
+        assert row["filter_reason"] is None
+
+
 def test_idempotent_on_repeated_apply(temp_db) -> None:
     """Re-applying the same verdict is a clean no-op modulo timestamps."""
     with closing(worker_db.connect(temp_db)) as conn:
