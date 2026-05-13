@@ -211,7 +211,7 @@ Hard requirements that must be preserved at all times:
 - [worker/tests/test_llm_schemas.py](../worker/tests/test_llm_schemas.py): updated `test_verdict_accepts_minimum_fields` to drop `category` and `reason` from the minimum payload (they default to None); added `test_verdict_accepts_null_category_and_reason` as a load-bearing regression guard tied to the live smoke discovery. Replaced `test_verdict_requires_reason` with `test_verdict_requires_score` (the field that stays required).
 - [worker/tests/test_cluster_verdict.py](../worker/tests/test_cluster_verdict.py): added `test_filtered_out_verdict_accepts_null_category_and_reason` proving the DB helper round-trips None values to the nullable columns without raising.
 - **Result: 622/622 pass via `uv run pytest` in 4.33s. `uv run ruff check .` and `uv run ruff format --check .` clean.** Up from 620/620 by 2 net new tests (replaced 1, added 2 explicit-null regression guards).
-- **Live-vMLX smoke (2026-05-12, full pass)**: ran clean against an isolated temp DB. Coverage captured in the build-log entry below.
+- **Live-vMLX smoke (2026-05-12, full pass)**: end-to-end run against `mlx-community/Qwen3.5-27B-4bit` completed in ~64 minutes. **Digest 1 published.** Coverage: 7 sources attempted / 3 succeeded (GDELT + GitHub-search fetch failures degraded coverage per design, run continued), 688 raw items → 674 clusters via L1+L2+L3, **57 successful LLM calls / 0 HTTP failures / 1 failed batch** (count mismatch — model emitted 11 verdicts for a 12-cluster batch; the load-bearing fail-loud guard in `parse_relevance_verdicts` caught it and `coverage.failed_filter_batches` recorded the degradation). **kept_clusters=242, filtered_out=420, pending=12** (the 12 from the failed batch). The handoff's acceptance criterion (`coverage.kept_clusters > 0` with clusters at `status='kept'`) is met. Throughput: ~1.1 batches/minute, ~28-30 tps generation on the 27B-4bit. See the build log entry below for the complete breakdown.
 
 ### Tests
 - [worker/tests/conftest.py](../worker/tests/conftest.py) — `temp_db` fixture applies all migrations to a fresh DB; tests never touch `data/digest.db`.
@@ -304,6 +304,25 @@ _None yet beyond what's captured in the design docs._
 ---
 
 ## Build log (append-only audit trail)
+
+### 2026-05-12 — Full end-to-end live-vMLX smoke (Phase 1 step 9 acceptance)
+- Run: `DIGEST_DB=/tmp/clawfeed_smoke_9b.db CLAWFEED_CONTACT_EMAIL=themindofmerlin@gmail.com uv run clawfeed-intel run daily --window 24h`. Started 17:30:30 PDT, published 18:34:09 PDT — **wall time 63 minutes**. Final state: `intel_runs.status='published'`, `digest_id=1` linked.
+- **Source plan**: 4 categories × 7 distinct tasks resolved from `config/intel-sources.yaml` + `source_categories` join. 3 sources succeeded (RSS, arXiv, HN, SEC, Reddit-equivalents — counted as a unit in coverage); 4 fetcher tasks failed and degraded coverage as designed (`ai_coding_tools:gdelt`, `startup_funding:gdelt`, `ai_coding_tools:github_search`, `github_traction:github_search`). GitHub-search 422 errors are a known YAML-query-syntax issue worth fixing in a separate follow-up; GDELT 5xx is transient.
+- **Fetch + cluster**: 688 raw items collected across all working source families → **674 clusters** after L1 canonical-URL + L2 content-fingerprint + L3 heuristic-event-similarity dedup chain. The chain is deterministic and replays cleanly; no cluster drift between identical inputs.
+- **Filtering (the load-bearing step 9 test)**:
+  - **57 batches** of 12 clusters each (∼56.2 batches expected; the 57th picks up the remainder).
+  - **All 57 LLM HTTP calls succeeded** — `llm_calls` table shows 57 rows with `status='succeeded'`, 0 with `status='failed'`. No retries fired (every batch landed on the first attempt).
+  - **1 batch failed semantically** at the parse layer (`verdict count mismatch: expected 12, got 11`). The model returned an 11-element array for a 12-cluster batch. The fail-loud guard in `parse_relevance_verdicts` caught it; `coverage.failed_filter_batches` incremented; those 12 clusters stayed at `status='pending'` and the run continued. This is *exactly* the architecture-doc "failed sources degrade coverage; they do not fail the run" rule working as designed — a single weird batch did not block the other 56 from publishing verdicts.
+  - **Verdict distribution**: 242 kept (36%), 420 filtered_out (62%), 12 pending (2% — the failed batch). The model's keep rate matches the architecture-doc expectation ("must be allowed to keep many items") — well above the top-N selector posture would produce.
+  - **Generation throughput**: ~28-30 tps on the 27B-4bit. Average batch latency ~60-90 seconds (lower for short verdict arrays, higher for verbose 12-verdict responses).
+  - **Token consumption**: averaged ~5700 prompt + ~1450 completion per batch. Total ~325K prompt + ~83K completion tokens across the 57 batches. Local tokens are unbounded per the Option-A rule — no rationing applies.
+- **Per-stage models stamped** correctly in `intel_runs.metadata.local_models.filter = "mlx-community/Qwen3.5-27B-4bit"`. When the architecture-doc-target flagship `Qwen3.5-122B-A10B-4bit` is downloaded, swapping is a YAML edit; no code change.
+- **Digest 1 published**: 601 chars of stub markdown surfaced through ClawFeed's `digests` table (`type='daily'`, `metadata.brief_kind='daily'`). The brief content is still the skeleton template (real composition lands in step 11); but the *coverage block* in the metadata is now load-bearing and accurate.
+- **Three real-world behaviors discovered and handled gracefully**:
+  1. **GitHub API 422** on certain topic-search queries → recorded as `failed_sources`, run continued.
+  2. **vMLX completion-token cap** truncating verdict JSON mid-string → fixed in 9b with `max_tokens` plumbing.
+  3. **Model emitting `null` category/reason on rejected verdicts** → fixed in 9c with schema relaxation.
+- **The wiring is verified end-to-end against real infrastructure.** Step 9 (relevance filter) is complete and validated. Ready for step 10 (cluster summary).
 
 ### 2026-05-12 — Relevance filter schema robustness (Phase 1 step 9c)
 - Triggered by the first end-to-end live-vMLX smoke against Qwen3.5-27B-4bit (run 1, 2026-05-12). Batch 1 of 57 failed schema validation with 7 errors, all of the form `verdicts.N.category — Input should be a valid string [type=string_type, input_value=None, input_type=NoneType]`. Model behavior: when `keep=false`, the model emits `category: null` and `reason: null` (no category to assign, no narrative needed for a rejection). Strict `str` schema requirement forced the bounded repair retry on every such batch and the repair also returned nulls. End result: entire batches lost to schema rejection.
