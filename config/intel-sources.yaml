@@ -57,7 +57,7 @@ categories:
       - kind: gdelt
         query: '("Claude Code" OR Codex OR Cursor OR Windsurf OR Continue.dev OR "AI coding" OR "coding agent")'
       - kind: github_search
-        query: "topic:ai-coding OR topic:agent OR topic:llm-agent"
+        query: '"claude code" OR aider OR windsurf OR "ai coding" OR "coding agent" in:name,description stars:>50'
 
   github_traction:
     description: Repositories gaining real velocity — not merely listed on Trending.
@@ -70,7 +70,7 @@ categories:
       - kind: github_trending
         language: null
       - kind: github_search
-        query: "topic:llm OR topic:agent OR topic:coding-agent"
+        query: 'topic:ai-agents stars:>500'
 
 dynamic_search:
   enabled_sources:
