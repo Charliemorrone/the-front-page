@@ -64,7 +64,36 @@ class RelevanceBatchResponse(_SchemaBase):
     verdicts: list[RelevanceVerdict]
 
 
+class ClusterSummaryPayload(_SchemaBase):
+    """One cluster's grounded summary from the cluster-summary stage.
+
+    Field shape from the architecture doc's "Prompt Responsibilities →
+    Cluster Summary" section. Only ``headline`` and ``summary`` are
+    required: these are the load-bearing signals the final composer
+    needs to render the cluster in the brief at all. Everything else
+    (``why_it_matters``, ``entities``, ``key_facts``, ``caveats``,
+    ``source_urls``, ``confidence``) is permissive — local models
+    routinely emit ``null`` or empty arrays for narrative additions
+    under load, and tightening the schema would force the bounded
+    repair retry on every cluster and still likely fail. The 9c lesson
+    applied at the start: the architecture-doc field list specifies
+    *what* the schema covers, not *which fields are required*. Tighten
+    later if the architecture-doc-target flagship (``Qwen3.5-122B-
+    A10B-4bit``) reliably emits richer payloads.
+    """
+
+    headline: str = Field(min_length=1)
+    summary: str = Field(min_length=1)
+    why_it_matters: str = ""
+    entities: list[str] = Field(default_factory=list)
+    key_facts: list[str] = Field(default_factory=list)
+    caveats: list[str] = Field(default_factory=list)
+    source_urls: list[str] = Field(default_factory=list)
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
 __all__ = (
+    "ClusterSummaryPayload",
     "RelevanceBatchResponse",
     "RelevanceVerdict",
 )

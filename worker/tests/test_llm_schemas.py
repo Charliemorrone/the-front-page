@@ -11,7 +11,11 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from clawfeed_intel.llm import RelevanceBatchResponse, RelevanceVerdict
+from clawfeed_intel.llm import (
+    ClusterSummaryPayload,
+    RelevanceBatchResponse,
+    RelevanceVerdict,
+)
 
 
 # ── RelevanceVerdict ──────────────────────────────────────────────────────────
@@ -185,3 +189,148 @@ def test_batch_response_propagates_verdict_validation() -> None:
                 ]
             }
         )
+
+
+# ── ClusterSummaryPayload ─────────────────────────────────────────────────────
+
+
+def _valid_summary_payload() -> dict[str, object]:
+    return {
+        "headline": "Anthropic closes $500M Series E",
+        "summary": (
+            "Anthropic announced a $500M Series E led by GeneralCo. "
+            "Existing investors participated. Proceeds fund model training."
+        ),
+        "why_it_matters": "Largest AI-lab financing of the week.",
+        "entities": ["Anthropic", "GeneralCo"],
+        "key_facts": ["$500M raise", "Series E", "Led by GeneralCo"],
+        "caveats": ["Valuation not disclosed."],
+        "source_urls": [
+            "https://techcrunch.com/anthropic-series-e",
+            "https://www.sec.gov/Archives/edgar/data/.../primary_doc.xml",
+        ],
+        "confidence": 0.85,
+    }
+
+
+def test_summary_accepts_full_payload() -> None:
+    payload = ClusterSummaryPayload.model_validate(_valid_summary_payload())
+    assert payload.headline.startswith("Anthropic")
+    assert payload.confidence == 0.85
+    assert payload.entities == ["Anthropic", "GeneralCo"]
+    assert len(payload.source_urls) == 2
+
+
+def test_summary_accepts_minimum_fields() -> None:
+    """Only ``headline`` and ``summary`` are required; everything else defaults."""
+    payload = ClusterSummaryPayload.model_validate(
+        {
+            "headline": "Headline only",
+            "summary": "One factual sentence.",
+        }
+    )
+    assert payload.why_it_matters == ""
+    assert payload.entities == []
+    assert payload.key_facts == []
+    assert payload.caveats == []
+    assert payload.source_urls == []
+    assert payload.confidence is None
+
+
+def test_summary_accepts_null_narrative_fields() -> None:
+    """The 9c-lesson regression guard for step 10.
+
+    Local 27B models routinely emit ``null`` for narrative fields under
+    load (no entities to surface for a sparse cluster, no caveats, no
+    confidence estimate). Tightening the schema would force the
+    repair retry on most clusters and still likely fail. Only
+    ``headline`` and ``summary`` are load-bearing; everything else
+    must accept reasonable absences.
+    """
+    payload = ClusterSummaryPayload.model_validate(
+        {
+            "headline": "Headline",
+            "summary": "Summary.",
+            "why_it_matters": "",
+            "entities": [],
+            "key_facts": [],
+            "caveats": [],
+            "source_urls": [],
+            "confidence": None,
+        }
+    )
+    assert payload.confidence is None
+    assert payload.entities == []
+
+
+def test_summary_confidence_lower_bound() -> None:
+    payload = _valid_summary_payload()
+    payload["confidence"] = -0.1
+    with pytest.raises(ValidationError):
+        ClusterSummaryPayload.model_validate(payload)
+
+
+def test_summary_confidence_upper_bound() -> None:
+    payload = _valid_summary_payload()
+    payload["confidence"] = 1.5
+    with pytest.raises(ValidationError):
+        ClusterSummaryPayload.model_validate(payload)
+
+
+def test_summary_requires_headline() -> None:
+    payload = _valid_summary_payload()
+    del payload["headline"]
+    with pytest.raises(ValidationError):
+        ClusterSummaryPayload.model_validate(payload)
+
+
+def test_summary_requires_summary() -> None:
+    payload = _valid_summary_payload()
+    del payload["summary"]
+    with pytest.raises(ValidationError):
+        ClusterSummaryPayload.model_validate(payload)
+
+
+def test_summary_rejects_blank_headline() -> None:
+    """``min_length=1`` combined with ``str_strip_whitespace=True``: a
+    whitespace-only headline fails validation. The brief can't render a
+    cluster without a headline, so this is enforced at the schema
+    boundary rather than relying on downstream presentation logic.
+    """
+    payload = _valid_summary_payload()
+    payload["headline"] = "   "
+    with pytest.raises(ValidationError):
+        ClusterSummaryPayload.model_validate(payload)
+
+
+def test_summary_rejects_blank_summary() -> None:
+    payload = _valid_summary_payload()
+    payload["summary"] = "\n\t"
+    with pytest.raises(ValidationError):
+        ClusterSummaryPayload.model_validate(payload)
+
+
+def test_summary_rejects_extra_fields() -> None:
+    payload = _valid_summary_payload()
+    payload["takeaways"] = ["hallucinated key"]
+    with pytest.raises(ValidationError):
+        ClusterSummaryPayload.model_validate(payload)
+
+
+def test_summary_strips_string_whitespace() -> None:
+    payload = _valid_summary_payload()
+    payload["headline"] = "  Anthropic closes $500M Series E  "
+    parsed = ClusterSummaryPayload.model_validate(payload)
+    assert parsed.headline == "Anthropic closes $500M Series E"
+
+
+def test_summary_round_trip_via_json() -> None:
+    """The LLM client validates via ``model_validate_json`` — exercise that path."""
+    raw = (
+        '{"headline": "Quiet release", "summary": "A small repo gained '
+        'attention.", "entities": ["acme/awesome"], "confidence": null}'
+    )
+    parsed = ClusterSummaryPayload.model_validate_json(raw)
+    assert parsed.headline == "Quiet release"
+    assert parsed.confidence is None
+    assert parsed.entities == ["acme/awesome"]

@@ -19,10 +19,11 @@ from .routing import (
     VmlxProviderConfig,
     load_routing,
 )
-from .schemas import RelevanceBatchResponse, RelevanceVerdict
+from .schemas import ClusterSummaryPayload, RelevanceBatchResponse, RelevanceVerdict
 
 __all__ = [
     "CallResult",
+    "ClusterSummaryPayload",
     "DEFAULT_CONFIG_PATH",
     "LLMClient",
     "LLMSchemaError",

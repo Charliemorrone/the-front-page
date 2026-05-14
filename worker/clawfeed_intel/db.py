@@ -20,9 +20,12 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from .paths import DB_PATH
+
+if TYPE_CHECKING:
+    from .llm.schemas import ClusterSummaryPayload
 
 RUN_TYPES: frozenset[str] = frozenset({"daily", "topic"})
 
@@ -818,6 +821,67 @@ def update_cluster_verdict(
         )
         if cur.rowcount == 0:
             raise LookupError(f"item_clusters row {cluster_id} not found")
+
+
+# ── item_summaries ────────────────────────────────────────────────────────────
+
+
+def create_item_summary(
+    conn: sqlite3.Connection,
+    *,
+    cluster_id: int,
+    model: str,
+    prompt_version: str,
+    payload: "ClusterSummaryPayload",
+) -> int:
+    """Append one row to ``item_summaries`` and return its id.
+
+    Called by the cluster-summary stage (step 10b) once per kept
+    cluster. The narrative list fields (``entities`` / ``key_facts`` /
+    ``caveats`` / ``source_urls``) round-trip through the TEXT columns
+    as JSON strings — the migration declares those columns ``DEFAULT
+    '[]'`` so an empty array survives canonical serialization. The
+    column is read back by the final composer (step 11) via
+    ``json.loads``.
+
+    ``model`` and ``prompt_version`` are validated non-empty at the
+    boundary so a future caller wiring up the helper directly can't
+    silently land a row without provenance. The cluster's status
+    advancement to ``'summarized'`` happens at the orchestration layer
+    in step 10b, not here — keeping the helper focused on a single
+    table lets the orchestration choose its own transaction boundary.
+    """
+    if not model:
+        raise ValueError("model is required")
+    if not prompt_version:
+        raise ValueError("prompt_version is required")
+
+    with transaction(conn):
+        cur = conn.execute(
+            """
+            INSERT INTO item_summaries (
+                cluster_id, model, prompt_version,
+                headline, summary, why_it_matters,
+                entities, key_facts, caveats,
+                confidence, source_urls
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                cluster_id,
+                model,
+                prompt_version,
+                payload.headline,
+                payload.summary,
+                payload.why_it_matters,
+                json.dumps(payload.entities),
+                json.dumps(payload.key_facts),
+                json.dumps(payload.caveats),
+                payload.confidence,
+                json.dumps(payload.source_urls),
+            ),
+        )
+        return int(cur.lastrowid or 0)
 
 
 # ── llm_calls ─────────────────────────────────────────────────────────────────
