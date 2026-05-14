@@ -109,6 +109,43 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
 
 
 def cmd_run_daily(args: argparse.Namespace) -> int:
+    # Preflight: vMLX must be reachable + the configured filter model must
+    # answer a single tiny chat completion before we touch fetch/cluster.
+    # Without this guard, "vMLX was down from the start" silently degrades:
+    # fetch + cluster succeed, every filter batch fails into
+    # `coverage.failed_filter_batches`, all clusters stay at `status='pending'`,
+    # and the run still publishes a stub digest with `kept_clusters=0` — which
+    # cron / OpenClaw would read as success. Mid-run hiccups continue to
+    # degrade per-batch as before; this only catches the "down from the
+    # start" case. Exit 3 distinguishes preflight failure from the existing
+    # 2 used for `ValueError` (bad window spec).
+    try:
+        routing = load_routing()
+    except Exception as exc:
+        print(
+            f"preflight: routing config failed to load: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return 3
+    try:
+        results = asyncio.run(doctor.run_doctor_probes(routing))
+    except Exception as exc:
+        print(
+            f"preflight: probes raised unexpectedly: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return 3
+
+    if any(not r.ok for r in results):
+        print("preflight: vMLX is not ready — aborting before run", file=sys.stderr)
+        for r in results:
+            marker = " ok " if r.ok else "FAIL"
+            print(
+                f"    [{marker}] {r.name:24s} {r.latency_ms:>5d}ms — {r.detail}",
+                file=sys.stderr,
+            )
+        return 3
+
     try:
         digest_id = run_daily(args.window)
     except ValueError as exc:
