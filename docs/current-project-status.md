@@ -3,7 +3,8 @@
 **Source of truth for engineers building this system. Update after every critical change.**
 
 - Repo: `/Users/merlin/clawfeed`
-- Last updated: 2026-05-13 (Node-side: dashboard UI for tagging sources to intel categories)
+- Remote: `origin` = https://github.com/Charliemorrone/the-front-page.git — **fully synced** through commit `5715f5e` (2026-05-13)
+- Last updated: 2026-05-13 (Phase 1 step 9 + four follow-up fixes pushed to origin; ready for step 10 cluster summary)
 - Last update by: implementation engineer (Claude)
 - Authoritative design docs:
   - [personal-intelligence-brief-architecture.md](personal-intelligence-brief-architecture.md) — full architecture
@@ -301,7 +302,14 @@ The **next milestone** (still Phase 1 in the user's framing) is closing the run 
    - ~~9a: schemas + pure prompt/parse helpers + `db.update_cluster_verdict`~~ ✅
    - ~~9b: async `filter_clusters` + orchestrator wiring + `Coverage.failed_filter_batches` + optional `temperature` plumbing in `LLMClient.chat_completion`~~ ✅
    - ~~9c: schema robustness from live smoke — `category` and `reason` become `str | None`~~ ✅
-4. **Cluster summary.** Per kept cluster → headline / facts / why-it-matters / caveats / citations. Stored in `item_summaries`.
+3a. ~~**Post-step-9 follow-ups** (four fixes from the audit cycle).~~ ✅ All landed and pushed 2026-05-13:
+    - ~~GitHub-search default queries returning 422 → reformulated to use valid GitHub search syntax (`51d26b5`)~~ ✅
+    - ~~vMLX preflight health check added to `clawfeed-intel run daily` (exits 3 on probe failure) (`3c7845a`)~~ ✅
+    - ~~Dashboard UI for tagging sources to intel categories — Node-side `setSourceCategories` + API surface + comma-separated UI field (`0c5d649`)~~ ✅
+    - ~~SSRF protection (`validate_safe_url`) on worker RSS top-level / trafilatura-article / website fetch paths (`5715f5e`)~~ ✅
+    - **Test suite at 692/692 after all four fixes.** Up from the 622 step-9 baseline.
+
+4. **Cluster summary.** Per kept cluster → headline / facts / why-it-matters / caveats / citations. Stored in `item_summaries`. **Next inspectable commit** — see [docs/handoff-cluster-summary.md](handoff-cluster-summary.md) for the fresh-agent handoff covering steps 10a + 10b.
 5. **Final composition.** OpenClaw/`gpt-5.3-codex` from condensed summaries + coverage. **Local `Qwen3.5-122B-A10B-4bit` fallback** if frontier path fails; metadata stamped `composition_provider: vmlx_fallback`.
 6. **Publish.** Direct `INSERT` into `digests` (type `daily`) with full coverage `metadata` (run_id, window, model choices, source counts, failed sources). `intel_runs.digest_id` linked, status `published`.
 7. **Acceptance gate.** Manual `clawfeed-intel run daily --window 24h` produces a digest visible at `http://127.0.0.1:8767/`. Phase 1 done.
