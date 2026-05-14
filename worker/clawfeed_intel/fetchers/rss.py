@@ -32,7 +32,7 @@ from selectolax.parser import HTMLParser
 from .. import normalize
 from ..sources import ResolvedTask, RssTask
 from .base import FETCHER_REGISTRY, FetchedItem
-from .http import build_client
+from .http import UnsafeUrlError, build_client, validate_safe_url
 
 log = logging.getLogger(__name__)
 
@@ -62,6 +62,13 @@ async def fetch_rss(conn: sqlite3.Connection, task: ResolvedTask) -> list[Fetche
         raise TypeError(f"fetch_rss expected RssTask, got {type(task.task).__name__}")
 
     feed_url = task.task.url
+    # Defense-in-depth: the feed URL is user-configured (lower-leverage than
+    # the trafilatura path below, which follows links extracted from
+    # third-party feed bodies), but DNS rebinding and pasted-from-the-web
+    # URLs can still point at LAN hosts. UnsafeUrlError propagates so the
+    # runner records this source as failed in coverage — same outcome as a
+    # 4xx.
+    await validate_safe_url(feed_url)
     async with build_client() as client:
         feed_text = await _fetch_feed(client, feed_url)
         items = await asyncio.to_thread(
@@ -271,7 +278,19 @@ async def _trafilatura_extract(client: httpx.AsyncClient, url: str) -> str | Non
 
     Lives behind a function boundary so tests can patch it without pulling
     in trafilatura itself or running real HTTP.
+
+    The article URL comes from inside a third-party feed body, so the SSRF
+    guard runs *here*, not just at the top of ``fetch_rss``: a poisoned
+    feed could include a link to ``http://192.168.1.1/admin`` that the
+    feed URL itself wouldn't reveal. UnsafeUrlError is logged and
+    swallowed (returns ``None``) to preserve the fallback's existing
+    best-effort contract — we keep the entry's original summary instead.
     """
+    try:
+        await validate_safe_url(url)
+    except UnsafeUrlError as exc:
+        log.warning("trafilatura: refusing unsafe url %s (%s)", url, exc)
+        return None
     try:
         resp = await client.get(url)
         if resp.status_code >= 400:

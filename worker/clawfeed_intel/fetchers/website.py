@@ -45,7 +45,7 @@ from selectolax.parser import HTMLParser
 from .. import normalize
 from ..sources import ResolvedTask, WebsiteTask
 from .base import FETCHER_REGISTRY, FetchedItem
-from .http import build_client
+from .http import build_client, validate_safe_url
 
 log = logging.getLogger(__name__)
 
@@ -69,6 +69,11 @@ async def fetch_website(conn: sqlite3.Connection, task: ResolvedTask) -> list[Fe
         raise TypeError(f"fetch_website expected WebsiteTask, got {type(task.task).__name__}")
 
     url = task.task.url
+    # Defense-in-depth SSRF guard for the user-configured page URL —
+    # protects against DNS rebinding and pasted-from-the-web URLs that
+    # point at LAN hosts. UnsafeUrlError propagates so the runner records
+    # this source as failed in coverage (same outcome as a 4xx).
+    await validate_safe_url(url)
     async with build_client() as client:
         resp = await client.get(url)
         resp.raise_for_status()

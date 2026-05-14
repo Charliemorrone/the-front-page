@@ -27,6 +27,8 @@ import httpx
 import pytest
 
 from clawfeed_intel.fetchers import FETCHER_REGISTRY
+from clawfeed_intel.fetchers import website as website_mod
+from clawfeed_intel.fetchers.http import UnsafeUrlError
 from clawfeed_intel.fetchers.website import (
     KIND,
     SOURCE_TYPE,
@@ -126,8 +128,20 @@ def patch_client(monkeypatch):
                 yield client
 
         monkeypatch.setattr("clawfeed_intel.fetchers.website.build_client", fake_build_client)
+        # Existing fetch tests want MockTransport-driven HTTP behavior, not
+        # DNS reachability of `x.example` from the test box. Default the
+        # SSRF guard to a no-op; the dedicated SSRF tests below override
+        # this to exercise the real boundary.
+        monkeypatch.setattr(
+            "clawfeed_intel.fetchers.website.validate_safe_url",
+            lambda _url: _noop(),
+        )
 
     return _patch
+
+
+async def _noop() -> None:
+    return None
 
 
 # ── parse_website_html (pure, with stubbed trafilatura) ───────────────────────
@@ -372,6 +386,39 @@ async def test_fetch_records_ua_with_contact(conn, patch_client, patch_extractor
     await fetch_website(conn, _task())
     assert "ClawFeed-Intel" in (captured["ua"] or "")
     assert "+contact:" in (captured["ua"] or "")
+
+
+async def test_fetch_website_raises_on_unsafe_url(monkeypatch, conn):
+    """An SSRF-rejected URL must raise so the runner records the source as
+    failed in coverage — same outcome as a 4xx response."""
+
+    async def reject(_url):
+        raise UnsafeUrlError("blocked host: 'router.lan'")
+
+    monkeypatch.setattr(website_mod, "validate_safe_url", reject)
+
+    with pytest.raises(UnsafeUrlError, match="blocked host"):
+        await fetch_website(conn, _task(url="http://router.lan/admin"))
+
+
+async def test_fetch_website_does_not_open_client_when_url_unsafe(monkeypatch, conn):
+    """The HTTP client must not be opened when the SSRF guard rejects."""
+    opened = {"n": 0}
+
+    async def reject(_url):
+        raise UnsafeUrlError("blocked ip literal")
+
+    @asynccontextmanager
+    async def tracking_client(*, follow_redirects: bool = True):
+        opened["n"] += 1
+        yield None  # pragma: no cover — should not be reached
+
+    monkeypatch.setattr(website_mod, "validate_safe_url", reject)
+    monkeypatch.setattr(website_mod, "build_client", tracking_client)
+
+    with pytest.raises(UnsafeUrlError):
+        await fetch_website(conn, _task(url="http://192.168.1.1/"))
+    assert opened["n"] == 0
 
 
 async def test_fetch_rejects_non_website_task(conn):

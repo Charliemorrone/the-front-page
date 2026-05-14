@@ -20,6 +20,7 @@ import pytest
 
 from clawfeed_intel.fetchers import FETCHER_REGISTRY
 from clawfeed_intel.fetchers import rss as rss_mod
+from clawfeed_intel.fetchers.http import UnsafeUrlError
 from clawfeed_intel.fetchers.rss import KIND, fetch_rss, parse_feed_text
 from clawfeed_intel.sources import ResolvedTask, RssTask
 
@@ -111,8 +112,20 @@ def patch_client(monkeypatch):
                 yield client
 
         monkeypatch.setattr("clawfeed_intel.fetchers.rss.build_client", fake_build_client)
+        # Existing fetch tests want MockTransport-driven HTTP behavior, not
+        # DNS reachability of `example.com` from the test box. Default the
+        # SSRF guard to a no-op; the dedicated SSRF tests below override
+        # this to exercise the real boundary.
+        monkeypatch.setattr(
+            "clawfeed_intel.fetchers.rss.validate_safe_url",
+            lambda _url: _noop(),
+        )
 
     return _patch
+
+
+async def _noop() -> None:  # awaitable no-op for the SSRF stub
+    return None
 
 
 # ── parse_feed_text (pure) ────────────────────────────────────────────────────
@@ -365,6 +378,113 @@ async def test_trafilatura_extract_returns_none_on_4xx(patch_client):
     async with rss_mod.build_client() as client:
         result = await rss_mod._trafilatura_extract(client, "https://x.example/blocked")
     assert result is None
+
+
+# ── SSRF guard integration ────────────────────────────────────────────────────
+
+
+async def test_fetch_rss_raises_on_unsafe_top_level_url(monkeypatch, conn):
+    """Top-level RSS URL that fails the SSRF guard must raise so the runner
+    records the source as failed in coverage — same outcome as a 4xx."""
+
+    async def reject(_url):
+        raise UnsafeUrlError("blocked host: 'router.lan'")
+
+    monkeypatch.setattr(rss_mod, "validate_safe_url", reject)
+
+    with pytest.raises(UnsafeUrlError, match="blocked host"):
+        await fetch_rss(conn, _task("http://router.lan/feed.xml"))
+
+
+async def test_fetch_rss_does_not_open_client_when_top_level_url_unsafe(monkeypatch, conn):
+    """The HTTP client must not be opened when SSRF guard rejects — pin
+    that the guard runs *before* the network code path."""
+    opened = {"n": 0}
+
+    async def reject(_url):
+        raise UnsafeUrlError("blocked host: 'localhost'")
+
+    @asynccontextmanager
+    async def tracking_client(*, follow_redirects: bool = True):
+        opened["n"] += 1
+        yield None  # pragma: no cover — should not be reached
+
+    monkeypatch.setattr(rss_mod, "validate_safe_url", reject)
+    monkeypatch.setattr(rss_mod, "build_client", tracking_client)
+
+    with pytest.raises(UnsafeUrlError):
+        await fetch_rss(conn, _task("http://localhost/feed"))
+    assert opened["n"] == 0
+
+
+async def test_trafilatura_extract_returns_none_on_unsafe_article_url(patch_client, monkeypatch):
+    """The trafilatura article-fetch path is the highest-leverage SSRF
+    surface: URLs come from inside third-party feed bodies. UnsafeUrlError
+    must be logged and swallowed (returns None) so the per-entry contract
+    stays best-effort and the rest of the feed continues."""
+
+    def handler(_request):  # pragma: no cover — HTTP must NOT be called
+        raise AssertionError("HTTP must not fire for an unsafe URL")
+
+    patch_client(handler)
+
+    # patch_client defaulted validate_safe_url to a no-op for the rest of
+    # the file; restore the real guard for this single test by raising.
+    async def reject(_url):
+        raise UnsafeUrlError("blocked host: 192.168.1.1")
+
+    monkeypatch.setattr(rss_mod, "validate_safe_url", reject)
+
+    async with rss_mod.build_client() as client:
+        result = await rss_mod._trafilatura_extract(client, "http://192.168.1.1/admin")
+    assert result is None
+
+
+async def test_trafilatura_fallback_skips_http_for_unsafe_link_in_thin_feed(
+    patch_client, monkeypatch, conn
+):
+    """End-to-end: a thin-summary feed with a poisoned article link.
+    The feed itself is fetched (the top-level URL is safe — patched), but
+    the trafilatura fallback for the poisoned link returns None, so the
+    item keeps its original thin summary instead of triggering an HTTP
+    fetch to the blocked host. The run does not abort."""
+
+    poisoned_feed = """<?xml version="1.0"?>
+<rss version="2.0"><channel>
+<item><title>Innocent-looking title</title><link>http://192.168.1.1/admin</link>
+<description>tiny summary.</description><pubDate>Sun, 04 May 2026 12:00:00 GMT</pubDate></item>
+</channel></rss>"""
+
+    article_calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "https://x.example/feed":
+            return httpx.Response(200, text=poisoned_feed)
+        article_calls["n"] += 1
+        # This is what we're guarding against — should never fire.
+        return httpx.Response(200, text="<html>private admin page</html>")
+
+    patch_client(handler)
+
+    # The top-level URL https://x.example/feed must pass; only the article
+    # URL inside the feed body is unsafe.
+    async def selective_guard(url):
+        from urllib.parse import urlsplit
+
+        host = urlsplit(url).hostname or ""
+        if host.startswith("192.168."):
+            raise UnsafeUrlError(f"blocked host: {host!r}")
+        return None
+
+    monkeypatch.setattr(rss_mod, "validate_safe_url", selective_guard)
+
+    items = await fetch_rss(conn, _task("https://x.example/feed"))
+    assert len(items) == 1
+    # Original summary preserved — trafilatura did NOT replace it because
+    # the SSRF guard short-circuited before any HTTP was attempted.
+    assert items[0].content == "tiny summary."
+    assert items[0].metadata.get("trafilatura") is None
+    assert article_calls["n"] == 0
 
 
 # ── registration ──────────────────────────────────────────────────────────────
