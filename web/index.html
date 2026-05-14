@@ -273,6 +273,7 @@ const I18N = {
     sourcesTotal: '总数', sourcesActive: '活跃', sourcesTypes: '类型',
     addSource: '➕ 添加源', editSource: '编辑', deleteSource: '删除',
     sourceName: '名称', sourceType: '类型', sourceConfig: '配置 (JSON)', sourcePublic: '公开',
+    sourceCategories: '简报分类（逗号分隔）', sourceCategoriesHint: '将此源标记给一个或多个简报分类，例如 startup_funding, ai_research',
     save: '保存', cancel: '取消',
     noSources: '暂无数据源', confirmDelete: '确定删除此数据源？',
     emptySourcesTitle: '📡 选择你的信息源',
@@ -334,6 +335,7 @@ const I18N = {
     sourcesTotal: 'Total', sourcesActive: 'Active', sourcesTypes: 'Types',
     addSource: '➕ Add Source', editSource: 'Edit', deleteSource: 'Delete',
     sourceName: 'Name', sourceType: 'Type', sourceConfig: 'Config (JSON)', sourcePublic: 'Public',
+    sourceCategories: 'Brief categories (comma-separated)', sourceCategoriesHint: 'Tag this source for one or more brief categories, e.g. startup_funding, ai_research',
     save: 'Save', cancel: 'Cancel',
     noSources: 'No sources yet', confirmDelete: 'Delete this source?',
     emptySourcesTitle: '📡 Choose Your Sources',
@@ -1235,10 +1237,13 @@ function renderSourceForm() {
   const s = editingSource;
   const typeOptions = SOURCE_TYPES.map(t => `<option value="${t}" ${s && s.type === t ? 'selected' : ''}>${SOURCE_ICONS[t] || ''} ${t}</option>`).join('');
   const configVal = s ? (typeof s.config === 'string' ? s.config : JSON.stringify(JSON.parse(s.config), null, 2)) : JSON.stringify(SOURCE_EXAMPLES['twitter_feed'], null, 2);
+  const categoriesVal = s && Array.isArray(s.categories) ? s.categories.join(', ') : '';
+  const escAttr = v => String(v).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   container.innerHTML = `<div class="source-form">
     <div class="form-row"><label>${t('sourceName')}</label><input id="sf_name" value="${s ? s.name : ''}" placeholder="e.g. AI Twitter Feed"></div>
     <div class="form-row"><label>${t('sourceType')}</label><select id="sf_type" onchange="onTypeChange()">${typeOptions}</select></div>
     <div class="form-row"><label>${t('sourceConfig')}</label><textarea id="sf_config" style="font-family:monospace;font-size:12px;min-height:100px;">${configVal}</textarea></div>
+    <div class="form-row"><label>${t('sourceCategories')}</label><input id="sf_categories" value="${escAttr(categoriesVal)}" placeholder="startup_funding, ai_research"><div style="font-size:11px;color:#666;margin-top:4px;">${t('sourceCategoriesHint')}</div></div>
     <div class="form-row" style="flex-direction:row;align-items:center;gap:10px;"><label style="cursor:pointer;display:flex;align-items:center;gap:6px;margin:0;"><input type="checkbox" id="sf_public" style="width:16px;height:16px;" ${s && s.is_public ? 'checked' : ''}> ${t('sourcePublic')}</label></div>
     <div class="form-actions">
       <button class="primary" onclick="saveSource()">${t('save')}</button>
@@ -1252,14 +1257,16 @@ async function saveSource() {
   const type = document.getElementById('sf_type').value;
   const config = document.getElementById('sf_config').value.trim();
   const isPublic = document.getElementById('sf_public').checked;
+  const catsRaw = (document.getElementById('sf_categories')?.value || '').trim();
+  const categories = catsRaw ? catsRaw.split(',').map(c => c.trim()).filter(Boolean) : [];
   if (!name) return;
   try { JSON.parse(config); } catch { showToast('Invalid JSON config'); return; }
   try {
     if (editingSource) {
-      await fetch(`${API}/sources/${editingSource.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify({ name, type, config, isPublic }) });
+      await fetch(`${API}/sources/${editingSource.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify({ name, type, config, isPublic, categories }) });
       showToast(t('sourceUpdated'));
     } else {
-      await fetch(`${API}/sources`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify({ name, type, config, isPublic }) });
+      await fetch(`${API}/sources`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify({ name, type, config, isPublic, categories }) });
       showToast(t('sourceCreated'));
     }
     showSourceForm = false; editingSource = null;

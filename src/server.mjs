@@ -7,7 +7,7 @@ import { fileURLToPath } from 'url';
 import { randomBytes, createHmac, timingSafeEqual } from 'crypto';
 import { lookup } from 'dns/promises';
 import { isIP } from 'net';
-import { getDb, listDigests, getDigest, createDigest, listMarks, createMark, deleteMark, getConfig, setConfig, upsertUser, createSession, getSession, deleteSession, listSources, getSource, createSource, updateSource, deleteSource, getSourceByTypeConfig, getUserBySlug, listDigestsByUser, countDigestsByUser, createPack, getPack, getPackBySlug, listPacks, incrementPackInstall, deletePack, listSubscriptions, subscribe, unsubscribe, bulkSubscribe, isSubscribed, createFeedback, getUserFeedback, getAllFeedback, replyToFeedback, updateFeedbackStatus, markFeedbackRead, getUnreadFeedbackCount } from './db.mjs';
+import { getDb, listDigests, getDigest, createDigest, listMarks, createMark, deleteMark, getConfig, setConfig, upsertUser, createSession, getSession, deleteSession, listSources, getSource, createSource, updateSource, deleteSource, getSourceByTypeConfig, getSourceCategories, setSourceCategories, getUserBySlug, listDigestsByUser, countDigestsByUser, createPack, getPack, getPackBySlug, listPacks, incrementPackInstall, deletePack, listSubscriptions, subscribe, unsubscribe, bulkSubscribe, isSubscribed, createFeedback, getUserFeedback, getAllFeedback, replyToFeedback, updateFeedbackStatus, markFeedbackRead, getUnreadFeedbackCount } from './db.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, '..');
@@ -647,13 +647,17 @@ const server = createServer(async (req, res) => {
       if (!s.is_public && (!req.user || s.created_by !== req.user.id)) {
         return json(res, { error: 'not found' }, 404);
       }
-      return json(res, s);
+      return json(res, { ...s, categories: getSourceCategories(db, s.id) });
     }
 
     if (req.method === 'POST' && path === '/api/sources') {
       if (!req.user) return json(res, { error: 'login required' }, 401);
       const body = await parseBody(req);
       const result = createSource(db, { ...body, createdBy: req.user.id });
+      if (Array.isArray(body.categories)) {
+        try { setSourceCategories(db, result.id, body.categories); }
+        catch (e) { return json(res, { error: e.message }, 400); }
+      }
       return json(res, result, 201);
     }
 
@@ -664,6 +668,10 @@ const server = createServer(async (req, res) => {
       if (s.created_by !== req.user.id) return json(res, { error: 'forbidden' }, 403);
       const body = await parseBody(req);
       updateSource(db, parseInt(sourceMatch[1]), body);
+      if (Array.isArray(body.categories)) {
+        try { setSourceCategories(db, s.id, body.categories); }
+        catch (e) { return json(res, { error: e.message }, 400); }
+      }
       return json(res, { ok: true });
     }
 

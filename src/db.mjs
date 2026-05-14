@@ -337,6 +337,32 @@ export function getSourceByTypeConfig(db, type, config) {
   return db.prepare('SELECT * FROM sources WHERE type = ? AND config = ?').get(type, config);
 }
 
+export function getSourceCategories(db, sourceId) {
+  return db.prepare('SELECT category FROM source_categories WHERE source_id = ? ORDER BY category').all(sourceId).map(r => r.category);
+}
+
+export function setSourceCategories(db, sourceId, categories) {
+  if (!Array.isArray(categories)) throw new Error('categories must be an array');
+  const cleaned = [];
+  const seen = new Set();
+  for (const raw of categories) {
+    if (typeof raw !== 'string') throw new Error('category must be a string');
+    const c = raw.trim();
+    if (!c) continue;
+    if (seen.has(c)) continue;
+    seen.add(c);
+    cleaned.push(c);
+  }
+  const del = db.prepare('DELETE FROM source_categories WHERE source_id = ?');
+  const ins = db.prepare('INSERT INTO source_categories (source_id, category) VALUES (?, ?)');
+  const run = db.transaction((sid, cats) => {
+    del.run(sid);
+    for (const c of cats) ins.run(sid, c);
+  });
+  run(sourceId, cleaned);
+  return cleaned;
+}
+
 // ── Source Packs ──
 
 export function createPack(db, { name, description, slug, sourcesJson, createdBy }) {
