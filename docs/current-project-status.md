@@ -4,7 +4,7 @@
 
 - Repo: `/Users/merlin/clawfeed`
 - Remote: `origin` = https://github.com/Charliemorrone/the-front-page.git — **fully synced** through commit `5715f5e` (2026-05-13)
-- Last updated: 2026-05-15 (Phase 6b — `clawfeed-intel cron install/uninstall/status` subcommands ship the macOS launchd LaunchAgent for the 06:15 daily-brief run. Destructive-default-off; tests stub launchctl. Test baseline 865 → 907. Architecture-doc Phase 5 + 6b now both complete; Step 12c live smoke + Phase 6c failure-mode runbook remain.)
+- Last updated: 2026-05-15 (Phase 6c — `clawfeed-intel run daily --dry-run` preflight + `docs/runbook.md` operations runbook. Architecture-doc Phase 6 is now closed. Test baseline 907 → 917. Only Step 12c — live Gemini CLI compose smoke — remains as an open architecture-doc item before topical search.)
 - Last update by: implementation engineer (Claude)
 - Authoritative design docs:
   - [personal-intelligence-brief-architecture.md](personal-intelligence-brief-architecture.md) — full architecture
@@ -386,7 +386,9 @@ The **next milestone** (still Phase 1 in the user's framing) is closing the run 
 **Phase 6 — Daily Operations** (architecture-doc Phase 6):
 - ~~6a: retention (`db.prune_raw_items_before` + `db.prune_llm_calls_before` + `clawfeed-intel cleanup` CLI)~~ ✅ (2026-05-15, pushed)
 - ~~6b: **launchd-based** daily schedule. `clawfeed-intel cron install/uninstall/status` writes `~/Library/LaunchAgents/local.clawfeed.daily-brief.plist` for `06:15` local.~~ ✅ (2026-05-15, local commit `f39e0a4`)
-- 6c: failure-mode runbook — exercise source timeout / malformed model output / unavailable vMLX / **Gemini CLI stall + timeout (the new Tier-1 failure mode)** / partial source coverage. Optional `clawfeed-intel run daily --dry-run` for cron-config verification.
+- ~~6c: failure-mode runbook + `clawfeed-intel run daily --dry-run` preflight diagnostic.~~ ✅ (2026-05-15, local commit `48972ae` + this commit)
+
+**Architecture-doc Phase 6 is now closed.** Topical search (architecture-doc Phase 7) is the next major capability slice; Step 12c (live Gemini CLI compose smoke) remains as a focused validation before Phase 7 work begins.
 
 **Deferred / declined**:
 - **OpenClaw provider integration**: dropped from pipeline scope (see 2026-05-15 scope-change entry below). The architecture-doc-stated need (frontier-class final composition) is met by Gemini CLI; the architecture-doc-stated transport (OpenClaw WebSocket gateway) is no longer required by Phase 1.
@@ -444,6 +446,30 @@ Step 12 (frontier compose via Gemini CLI) lands **before** Phase 6b (launchd sch
 ---
 
 ## Build log (append-only audit trail)
+
+### 2026-05-15 — `run daily --dry-run` preflight + operations runbook (Phase 6c)
+- Closes architecture-doc Phase 6 ("Daily Operations"). Two pieces:
+  - **`clawfeed-intel run daily --dry-run`** — operational diagnostic; validates routing + vMLX + Gemini CLI + source plan + log dir + launchd registration in one structured report, then exits without invoking fetchers or LLM stages.
+  - **`docs/runbook.md`** — operator-facing reference document covering quick diagnostic commands, the `composition_provider` tag table for reading published briefs, failure modes (vMLX down, Gemini CLI auth expiry, Gemini stalls, both-compose-tiers-fail, source rate limits, malformed JSON, DB locked, launchd not firing, empty brief), recovery procedures, and useful SQLite queries.
+- [worker/clawfeed_intel/cli.py](../worker/clawfeed_intel/cli.py): `--dry-run` flag on the `daily` subparser. New `cmd_run_daily_dry_run(args)` runs the preflight pipeline section-by-section, with each section printing `[ ok ]` / `[FAIL]` / `[info]` / `[warn]` markers and a one-line detail. The live (non-dry-run) `cmd_run_daily` path is unchanged except for the new `if args.dry_run: return cmd_run_daily_dry_run(args)` branch at the top — same preflight contract, same exit code (3) on failure.
+- **Critical-vs-informational distinction**: the dry-run exits 3 only on failures that would prevent the live run from succeeding (routing parse, vMLX probe, gemini_cli binaries missing when the provider is configured, source plan raise, log dir creation failure). Informational sections (launchd installation status, source plan warnings, missing gemini_cli provider entirely) print but never fail the check — they're inspection, not pass/fail.
+- **Why a separate dry-run command rather than dry-running the live `run_daily` orchestrator**: the orchestrator is built around side effects (DB writes per state transition, async LLM dispatch, fetcher HTTP calls). A "dry-run mode" inside the orchestrator would require threading a no-op flag through every layer. Adding a parallel preflight function that only inspects configuration + reachability is a clean separation of concerns.
+- **`gemini_cli` binary reachability check is load-bearing**: it caught (and continues to catch) the broken-node@22 environmental gotcha — without the dry-run, the first 06:15 launchd fire after a fresh install would discover the bad config the hard way. Now it's a one-command preflight.
+- [worker/tests/test_cli_run_daily.py](../worker/tests/test_cli_run_daily.py): existing tests get `dry_run=False` added to their argparse Namespace fixtures. 10 new tests for the dry-run path:
+  - Short-circuit: `--dry-run` never invokes `run_daily`.
+  - All six sections (`[routing]`, `[vmlx]`, `[gemini_cli]`, `[source_plan]`, `[log_dir]`, `[launchd]`) appear in output.
+  - `final_compose` routing reported with fallback details.
+  - Routing config failure → exit 3 with FileNotFoundError surfaced.
+  - vMLX probe failure → exit 3 + subsequent sections not printed.
+  - `gemini_cli` binaries missing → exit 3 with `binaries missing` message.
+  - `gemini_cli` provider unconfigured entirely → exit 0 + `[warn] provider not declared`.
+  - `source_plan` raise → exit 3 with `resolver raised` surfaced.
+  - LaunchAgent not installed → `[info] not installed` + suggested `cron install --install` command.
+  - LaunchAgent installed → `[ ok ] installed at <path>`.
+- **Test isolation**: every dry-run test uses the same `_setup_dry_run_environment` helper that monkeypatches `cli.load_routing` / `cli.build_source_plan` / `cli.run_daily` / `doctor.run_doctor_probes` / `launchagent.Path` / `launchagent.REPO_ROOT` and creates fake Gemini CLI binaries in `tmp_path`. No live network, no real subprocess, no operator-home-dir touch.
+- [docs/runbook.md](runbook.md): new ~400-line operations reference. Sections: What runs when / Quick diagnostic commands / Reading a published brief (with the `composition_provider` tag table) / Failure modes (11 distinct modes with symptom + diagnosis + recovery for each) / Recovery procedures (vMLX restart, Gemini OAuth refresh, LaunchAgent reinstall, manual run re-fire, data prune) / Useful one-off SQLite queries / "When to file a bug vs adjust config" decision table.
+- **Result**: 917/917 pass via `uv run pytest` in 5.48s. `uv run ruff check .` + `uv run ruff format --check .` clean. Up from 907/907 by 10 net new tests, no existing tests removed.
+- **Status after this commit**: architecture-doc Phase 6 (Daily Operations) is now closed end-to-end. Daily brief runs at 06:15 via launchd; retention keeps the DB bounded; dry-run preflight validates config + reachability; the runbook documents every failure mode with recovery steps. Step 12c (live Gemini CLI compose smoke) remains as a focused one-shot validation. Phase 7 (topical search) is the next major capability.
 
 ### 2026-05-15 — launchd schedule install/uninstall/status (Phase 6b)
 - Closes the architecture-doc Phase 6 scheduling slice. The 2026-05-15 amendment specified macOS `launchd` as the mechanism — OpenClaw cron schedules `agentTurn` / `systemEvent` payloads (LLM calls), not arbitrary shell commands, so it was the wrong primitive for firing a deterministic Python CLI on a clock. Phase 6b ships the install/uninstall/status helpers; once an operator runs `clawfeed-intel cron install --install`, the daily brief fires at 06:15 local without further intervention.
