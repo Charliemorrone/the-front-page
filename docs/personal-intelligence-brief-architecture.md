@@ -125,6 +125,15 @@ ClawFeed should own:
 - Finished brief documents.
 - Dashboard access.
 
+#### Amendment, 2026-05-15: OpenClaw drops out of the brief-pipeline scope
+
+The two pipeline touchpoints originally assigned to OpenClaw — daily-run scheduling and frontier final composition — have both been reassigned after investigation against the actual installed OpenClaw build and the available alternatives:
+
+- **Daily-run scheduling** moves to macOS `launchd` (`~/Library/LaunchAgents/local.clawfeed.daily-brief.plist`, fired at `06:15` local). OpenClaw cron's real surface schedules `agentTurn` / `systemEvent` payloads — i.e. scheduled LLM calls — not arbitrary shell exec. The daily brief is a deterministic shell command, so `launchd` is the right macOS primitive. See "Scheduling And Deployment → Daily Schedule" below for the updated example.
+- **Frontier final composition** moves to **Gemini CLI** (`gemini-3-pro`) invoked as a subprocess. The non-negotiable is that the final document is composed by a frontier-class model; the original mechanism (OpenClaw → `gpt-5.3-codex`) is blocked on the gateway wire protocol being undocumented for non-Node clients. Gemini 3 via the Gemini CLI gives the same model-class with a stable subprocess contract, OAuth-managed auth, and generous Gemini Pro plan rate limits for once-a-day batch use. See "LLM Architecture → Model Routing" below for the updated stage config.
+
+This is a **pipeline-scope amendment only**. The original ClawFeed product surface (dashboard, user-facing agent features) remains free to integrate with OpenClaw as it always did. A future conversational-query phase against finished briefs may revisit OpenClaw as the agent runtime; that's a separate UI-layer decision and does not affect the daily-brief pipeline.
+
 ### 5. Twitter/X Is Out Of Scope For v1
 
 Decision: **Do not include Twitter/X in v1.**
@@ -597,7 +606,7 @@ Do not scatter direct LLM HTTP calls throughout the pipeline.
 
 ## Model Routing
 
-`config/model-routing.yaml`:
+`config/model-routing.yaml` (amended 2026-05-15 — `final_compose` moves from OpenClaw to Gemini CLI; OpenClaw provider is removed from the brief pipeline):
 
 ```yaml
 providers:
@@ -605,10 +614,18 @@ providers:
     base_url: http://127.0.0.1:8080/v1
     api_key_env: VMLX_API_KEY
     required: true
-  openclaw:
-    gateway_url: ws://127.0.0.1:18789
-    model: gpt-5.3-codex
-    required_for_final_compose: false
+  gemini_cli:
+    # Subprocess transport — no HTTP. The worker invokes the Gemini CLI
+    # directly. `executable_path` lets us bypass a broken PATH-resolved
+    # node binary (the local node@22 is linked against an absent simdjson
+    # version; gemini's shebang resolves via PATH so we hardcode the
+    # working node here).
+    executable_path: /opt/homebrew/bin/node
+    script_path: /opt/homebrew/bin/gemini
+    approval_mode: plan  # read-only — model cannot take actions
+    output_format: stream-json
+    idle_timeout_seconds: 60   # per-line gap that triggers stall detection
+    hard_timeout_seconds: 300  # total wall-clock cap
 
 stages:
   source_planning:
@@ -631,9 +648,11 @@ stages:
     model: mlx-community/Qwen3.5-122B-A10B-4bit
     timeout_seconds: 300
   final_compose:
-    provider: openclaw
-    model: gpt-5.3-codex
+    provider: gemini_cli
+    model: gemini-3-pro
     timeout_seconds: 300
+    retries: 1               # one retry on stall/timeout/non-zero exit
+    retry_backoff_seconds: 10
     fallback:
       provider: vmlx
       model: mlx-community/Qwen3.5-122B-A10B-4bit
@@ -643,7 +662,7 @@ stages:
       - Qwen/Qwen3.6-35B-A3B
 ```
 
-If OpenClaw/frontier is unavailable, the system should still produce a brief using the strongest local model and mark the run metadata with `composition_provider: vmlx_fallback`.
+If the Gemini CLI call fails after its single retry, the system falls back to the strongest local vMLX model and stamps `composition_provider: vmlx_fallback`. If that also fails, the deterministic `render_fallback_brief` path emits a structured Markdown brief built directly from the cluster summaries (no LLM call) and stamps `composition_provider: local_stub_failed`. The brief always publishes; the metadata always tells the truth about which tier produced it.
 
 ## Prompt Responsibilities
 
@@ -1076,12 +1095,22 @@ Reasoning:
 
 ### Daily Schedule
 
-Recommended:
+Amended 2026-05-15: the daily brief is scheduled via macOS **`launchd`**, not OpenClaw cron. OpenClaw cron's real surface schedules `agentTurn` / `systemEvent` payloads (LLM calls), not arbitrary shell exec — so it isn't the right primitive for triggering the daily-brief CLI. `launchd` is the macOS-native scheduler for shell commands and ships in Phase 6b through a small installer subcommand.
 
 ```bash
-openclaw cron add personal-daily-brief "15 6 * * *" \
-  "cd /Users/merlin/clawfeed && uv run clawfeed-intel run daily --window 24h"
+# Installed by `clawfeed-intel cron install --install` in Phase 6b.
+# Dry-run preview without `--install` prints the rendered plist without
+# touching disk; mirrors the destructive-default-off posture from
+# Phase 6a's cleanup CLI.
 ```
+
+The installed agent (path: `~/Library/LaunchAgents/local.clawfeed.daily-brief.plist`) fires at `06:15` local each day and invokes:
+
+```bash
+cd /Users/merlin/clawfeed && uv run clawfeed-intel run daily --window 24h
+```
+
+Load/unload uses the modern `launchctl bootstrap gui/<uid>` / `launchctl bootout` interface (not the deprecated `launchctl load`). Standard output and standard error are captured to `data/logs/daily-brief.{out,err}.log` for post-hoc inspection.
 
 ### Worker Daemon
 
@@ -1477,6 +1506,37 @@ Mitigation:
 - Conservative limits.
 - Local relevance threshold.
 - Clear source weighting.
+
+### Gemini CLI Tail Latency And Stream Stalls (Added 2026-05-15)
+
+Gemini CLI (the Phase-1-final-compose mechanism after the 2026-05-15 amendment) occasionally stalls mid-response on long generations. The model continues to be reachable but the local CLI process stops emitting tokens without erroring, producing an indefinite hang.
+
+Mitigation:
+
+- Use `stream-json` output mode so the provider sees per-token events. Track the gap between events as the stall signal — far faster than waiting out a wall-clock timeout.
+- Per-token-idle threshold (60s) plus a hard wall-clock cap (300s). Either trigger sends `SIGTERM` to the subprocess; if it doesn't exit within 5s, send `SIGKILL`.
+- One retry on stall / timeout / non-zero exit with a 10s backoff.
+- Tier-2 fallback to local vMLX compose (`Qwen3.5-122B-A10B-4bit`) using the same prompt. Tier-3 fallback to the deterministic `render_fallback_brief` path.
+- `composition_provider` metadata always reflects which tier produced the brief, so persistent Tier-2/3 days are visible to the operator.
+
+### Node Toolchain Drift Can Disable Locally-Installed Node CLIs (Added 2026-05-15)
+
+The local `/opt/homebrew/opt/node@22/bin/node` is linked against `libsimdjson.30.dylib`, which homebrew has upgraded out (only versions 33/34.x are installed). The system PATH puts this broken `node@22` ahead of the working `/opt/homebrew/bin/node` v25.9.0, so any Node CLI whose shebang resolves through PATH (`gemini`, `openclaw`, others) fails at startup with a dyld linker error.
+
+Mitigation:
+
+- The Gemini CLI provider invokes the working node binary explicitly via `executable_path` in `model-routing.yaml`, rather than relying on PATH resolution.
+- This is brittle long-term. The correct fix is to repair the local node toolchain (reinstall `simdjson@4.2`, or migrate `node@22` consumers to node 25). Tracked as an environmental risk in `docs/current-project-status.md`.
+
+### Frontier CLI Subprocess Reliability vs API Reliability (Added 2026-05-15)
+
+Calling a frontier model through a CLI subprocess (rather than directly via an HTTP API) trades one set of failure modes for another. The CLI handles auth, model selection, and request shaping for us — but it introduces process-level failure modes (broken shebang resolution, OAuth refresh during long calls, stream stalls in the CLI's internal buffering) that an HTTP client would not have.
+
+This tradeoff is accepted because:
+
+- The Pro plan's CLI-based auth removes API-key management from the worker.
+- The CLI's subprocess contract (stdin → stdout → exit code) is stable across CLI versions in ways the underlying gateway/API protocol may not be.
+- For one composition call per day, the additional process-management cost is a few dozen lines of provider code, and the fallback chain ensures a degraded brief still publishes even if every CLI mode fails.
 
 ## Build Chronology Summary
 

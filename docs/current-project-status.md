@@ -4,7 +4,7 @@
 
 - Repo: `/Users/merlin/clawfeed`
 - Remote: `origin` = https://github.com/Charliemorrone/the-front-page.git — **fully synced** through commit `5715f5e` (2026-05-13)
-- Last updated: 2026-05-15 (Phase 6a — retention helpers + `clawfeed-intel cleanup` CLI — landed; daily operation can now run indefinitely without unbounded DB growth)
+- Last updated: 2026-05-15 (design decisions recorded: frontier final compose moves to **Gemini CLI** subprocess provider with Gemini 3 as the model; Phase 6b scheduling moves to **macOS launchd**; OpenClaw drops out of pipeline scope. No code changes yet — implementation lands as Step 12 + Phase 6b in the next commits.)
 - Last update by: implementation engineer (Claude)
 - Authoritative design docs:
   - [personal-intelligence-brief-architecture.md](personal-intelligence-brief-architecture.md) — full architecture
@@ -378,13 +378,18 @@ The **next milestone** (still Phase 1 in the user's framing) is closing the run 
 6. ~~**Publish.**~~ ✅ Direct `INSERT` into `digests` (type `daily`) with full coverage `metadata` (run_id, window, model choices, source counts, failed sources, composition provider). `intel_runs.digest_id` linked, status `published`. Implemented at step 3, now exercises the full real-content path.
 7. **Acceptance gate.** Manual `clawfeed-intel run daily --window 24h` produces a digest visible at `http://127.0.0.1:8767/`. **Compose stage proven against live vMLX** (focused smoke 2026-05-15: 5 seeded clusters → 4635-char publishable brief in 44.8s on Qwen3.5-27B-4bit). Full end-to-end 24h pipeline smoke pending a faster local flagship (`Qwen3.5-122B-A10B-4bit` not yet on disk; on the 27B-4bit the filter + summary stages take ~2 hours wall-time for a realistic kept-cluster count).
 
+**Step 12 — Frontier final composition via Gemini CLI** (completes architecture-doc Phase 5, lands BEFORE Phase 6b):
+- 12a: `worker/clawfeed_intel/llm/gemini_cli.py` provider. Async subprocess wrapper around `gemini -p ... -o stream-json --approval-mode plan -m gemini-3-pro`. Per-line idle detection, per-token-idle threshold (60s) + hard wall-clock cap (300s), `SIGTERM`+grace+`SIGKILL` discipline, one retry on stall. DB audit via existing `record_llm_call`. Tests: subprocess monkeypatched (no live Gemini API in CI) — happy path, stall-detected, hard-timeout, non-zero exit, malformed output, oauth-expiry-like error.
+- 12b: routing + compose-stage wiring. `LLMClient` learns dual-dispatch (HTTP and CLI providers). `compose_brief` gets the three-tier fallback chain: Gemini CLI → vMLX local compose → deterministic `render_fallback_brief`. `composition_provider` values expand: `"gemini_cli"` / `"vmlx_fallback"` / `"local_stub_failed"` / `"local_stub_empty"`. `config/model-routing.yaml` routes `final_compose` to the new `gemini_cli` provider; vMLX entry retained as Tier-2 fallback.
+- 12c: live smoke against Gemini CLI with the same 5-cluster seed used for the 2026-05-15 vMLX smoke. Compare quality, latency, citation preservation. Document tail behavior. Update status doc.
+
 **Phase 6 — Daily Operations** (architecture-doc Phase 6):
 - ~~6a: retention (`db.prune_raw_items_before` + `db.prune_llm_calls_before` + `clawfeed-intel cleanup` CLI)~~ ✅ (2026-05-15, local commit)
-- 6b: cron registration helper for the 6:15am daily run (OpenClaw cron entry script)
-- 6c: failure-mode runbook — exercise source timeout / malformed model output / unavailable vMLX / partial coverage with real-environment confirmation
+- 6b: **launchd-based** daily schedule. `clawfeed-intel cron install/uninstall/status` writes `~/Library/LaunchAgents/local.clawfeed.daily-brief.plist` for `06:15` local. Dry-run by default; `--install` opt-in (mirroring Phase 6a's destructive-default-off posture). `launchctl bootstrap`/`bootout` for load/unload. Tests stub `launchctl` via monkeypatch — no live launchd touch in CI. Subcommand name kept as `cron` for operator vocabulary; mechanism is launchd. **Lands after Step 12** so the first scheduled run uses frontier compose.
+- 6c: failure-mode runbook — exercise source timeout / malformed model output / unavailable vMLX / **Gemini CLI stall + timeout (the new Tier-1 failure mode)** / partial source coverage. Optional `clawfeed-intel run daily --dry-run` for cron-config verification.
 
-**Deferred to a future phase**:
-- OpenClaw provider integration (WebSocket transport + `gpt-5.3-codex` routing). Adds frontier prose quality and offloads a long local compose call. Blocked on gateway wire-protocol spec.
+**Deferred / declined**:
+- **OpenClaw provider integration**: dropped from pipeline scope (see 2026-05-15 scope-change entry below). The architecture-doc-stated need (frontier-class final composition) is met by Gemini CLI; the architecture-doc-stated transport (OpenClaw WebSocket gateway) is no longer required by Phase 1.
 - Full 24h end-to-end smoke with real fetchers. Blocked on faster local flagship (`Qwen3.5-122B-A10B-4bit` or comparable A3B MoE).
 
 ---
@@ -403,18 +408,54 @@ The **next milestone** (still Phase 1 in the user's framing) is closing the run 
 | Reddit/SEC/GDELT rate-limit & UA contracts | accepted | Each fetcher declares contact email in UA. SEC: ≤10 req/s. Reddit: conservative. GDELT: polite. |
 | Twitter/X | out of scope | Explicitly excluded from v1 per architecture doc. |
 | Worker tests separate from `test/e2e.sh` | accepted | Python worker uses `pytest` under `worker/tests/`; bash e2e stays as-is. |
-| Local Node binary has a broken simdjson dyld link | environmental | System-level brew issue, unrelated to this project. Use `sqlite3` for DB checks; the running ClawFeed server presumably uses a different node binary. |
+| Local Node binary has a broken simdjson dyld link | environmental, now load-bearing | `/opt/homebrew/opt/node@22/bin/node` (first on PATH) is linked against `libsimdjson.30.dylib` which homebrew has upgraded out (only 33/34.x are installed). `/opt/homebrew/bin/node` v25.9.0 works fine; this is what the Step 12 Gemini CLI provider invokes explicitly via `executable_path` routing-config override. Also blocks the `openclaw` CLI, but OpenClaw is out of pipeline scope per the 2026-05-15 decision below. |
+| Frontier composition mechanism: OpenClaw → Gemini CLI | resolved 2026-05-15 (decision) | OpenClaw gateway wire protocol still unspecified for non-Node clients. Gemini 3 via the Gemini CLI subprocess gives us a stable, documented, OAuth-managed interface to a frontier-class model. Lands as Step 12 (before Phase 6b). Tier-2 fallback to local vMLX preserved; `composition_provider` metadata expands to `"gemini_cli"` / `"vmlx_fallback"` / `"local_stub_*"`. |
+| Gemini CLI tail-latency / stream stalls | open, mitigated in design | Gemini Pro 3 occasionally stalls mid-stream on long responses. Mitigations baked into Step 12 provider: `-o stream-json` per-line idle detection, per-token-idle threshold (60s) + hard wall-clock cap (300s), `SIGTERM`+grace+`SIGKILL` discipline, one retry on stall, three-tier fallback. Persistent Tier-2 days surface in `composition_provider` metadata for operator visibility. |
+| Daily-brief scheduling mechanism: OpenClaw cron → launchd | resolved 2026-05-15 (decision) | OpenClaw cron runs `agentTurn`/`systemEvent` payloads, not shell commands — verified by reading `/opt/homebrew/lib/node_modules/openclaw/dist/cron-cli-CeKWtNhW.js:181` and the actual `~/.openclaw/cron/jobs.json` shape. The architecture-doc example `openclaw cron add NAME "<expr>" "<command>"` does not match the real CLI. Phase 6b ships a `~/Library/LaunchAgents/local.clawfeed.daily-brief.plist` install/uninstall helper instead. |
 
 ---
 
 ## Scope changes & decisions
 
-_None yet beyond what's captured in the design docs._
+### 2026-05-15 — Frontier final composition mechanism: Gemini CLI (not OpenClaw)
+
+The architecture doc requires final composition to be done by a frontier-class model. The original mechanism named was OpenClaw → `gpt-5.3-codex` via the local gateway. After investigation:
+
+- **OpenClaw gateway wire protocol is undocumented for non-Node callers** (open risk since project start; no movement).
+- **The local `openclaw` and `gemini` Node CLIs share the same broken `node@22`/`simdjson.30.dylib` linkage**, but the simpler binary surface of Gemini CLI plus its widely-deployed `-p`/stdin batch contract makes it the more dependable integration target.
+- **The non-negotiable is the model class, not the transport.** Gemini 3 (Pro plan, OAuth-authed via Gemini CLI on this machine) is frontier-class for the synthesis task; it satisfies the "consistent formatting, no hallucinations, no repeats, grammar-clean" bar that motivated requiring frontier composition.
+- **The Gemini Pro plan ceiling is generous** for once-a-day batch use.
+
+Decision: implement final composition via a **Gemini CLI subprocess provider** routed from the existing `final_compose` stage. Model: **`gemini-3-pro`** (latest stable). vMLX local compose stays as the Tier-2 fallback; deterministic `render_fallback_brief` stays as Tier-3.
+
+### 2026-05-15 — Daily-brief scheduling mechanism: launchd (not OpenClaw cron)
+
+The architecture doc's `openclaw cron add personal-daily-brief "15 6 * * *" "<shell command>"` example does not match the real OpenClaw CLI surface. OpenClaw cron is designed for `agentTurn` / `systemEvent` payloads — i.e. scheduled LLM calls — not arbitrary shell exec. The daily brief is a deterministic Python/shell command and needs a shell-cron primitive. macOS `launchd` (via a `~/Library/LaunchAgents/local.clawfeed.daily-brief.plist`) is the native mechanism and ships in Phase 6b.
+
+### 2026-05-15 — OpenClaw drops out of pipeline scope
+
+With both touchpoints replaced (final compose → Gemini CLI; daily scheduling → launchd), **OpenClaw is no longer used anywhere in the personal-intelligence-brief pipeline.** This is a pipeline-scope decision only — the original ClawFeed product surface (dashboard, user-facing agent features) remains free to use OpenClaw as it always did; the worker doesn't touch that integration. If a future phase wants conversational query against finished briefs, that's a separate UI-layer integration decision.
+
+### Phase numbering for the next slice
+
+Step 12 (frontier compose via Gemini CLI) lands **before** Phase 6b (launchd schedule). Reason: there's no point scheduling daily runs that aren't yet frontier-composed — the non-negotiable hits the published brief, not the scheduler. After Step 12 + 6b, Phase 6c exercises the three-tier fallback chain in the failure-mode runbook.
 
 
 ---
 
 ## Build log (append-only audit trail)
+
+### 2026-05-15 — Design decisions: frontier compose via Gemini CLI + launchd scheduling (no code yet)
+- **Frontier composition becomes mandatory and non-negotiable** per the user: every published brief is composed by a frontier-class model. The motivations are consistent formatting, zero hallucinations, no repeats, grammar-clean prose, and a frontier-class quality overview on every brief. The architecture doc originally routed this through OpenClaw → `gpt-5.3-codex`; the OpenClaw gateway wire protocol has been the standing open risk since project start and hasn't moved.
+- **Three frontier options considered**: (1) Gemini CLI (signed in via Gemini Pro plan), (2) OpenAI Codex CLI (OAuth-authed), (3) OpenClaw daemon (downloaded, running). Detailed comparison in conversation: integration cost (CLI subprocess wins over WebSocket JSON-RPC), reliability surface (CLI subprocess wins — no long-running daemon dependency), wire-protocol stability (CLI wins — stable command-line contract vs undocumented gateway), quality (essentially tied at frontier scale).
+- **Decision: Gemini CLI subprocess provider; model `gemini-3-pro`.** Gemini Pro plan rate-limit ceiling is generous for one composition call per day. CLI is invoked via `gemini -p <flatten(messages)> -o stream-json --approval-mode plan -m gemini-3-pro` with stdin used for the actual prompt body (avoids shell-escape pitfalls in long prompts).
+- **Timeout / stream-stall mitigation strategy** (Gemini CLI's known tail behavior on Pro 3): `stream-json` output gives per-line token events; the provider tracks the gap between events. Per-token-idle threshold 60s and hard wall-clock cap 300s; either trigger sends `SIGTERM` (5s grace) then `SIGKILL`. One retry on stall/timeout/non-zero exit with 10s backoff. Then Tier-2 fallback to local vMLX, then Tier-3 to deterministic `render_fallback_brief`. `composition_provider` metadata expands to `"gemini_cli"` / `"vmlx_fallback"` / `"local_stub_failed"` / `"local_stub_empty"` so persistent Tier-2 days are visible to the operator.
+- **Environmental gotcha — load-bearing**: `/opt/homebrew/opt/node@22/bin/node` (first on PATH) is broken — links against `libsimdjson.30.dylib` which homebrew has upgraded out. Working node at `/opt/homebrew/bin/node` (v25.9.0); verified `/opt/homebrew/bin/node /opt/homebrew/bin/gemini --version` returns `0.36.0` cleanly. The provider gets an `executable_path:` routing-config field so we hardcode the working node on this machine without depending on the user fixing PATH.
+- **Scheduling mechanism: launchd, not OpenClaw cron.** Verified by reading `/opt/homebrew/lib/node_modules/openclaw/dist/cron-cli-CeKWtNhW.js:181` and the actual `~/.openclaw/cron/jobs.json` shape: OpenClaw cron schedules `agentTurn` / `systemEvent` payloads (LLM calls), not shell commands. The architecture-doc example `openclaw cron add NAME "<expr>" "<command>"` does not match the real CLI. Phase 6b ships `~/Library/LaunchAgents/local.clawfeed.daily-brief.plist` for `06:15` local time.
+- **OpenClaw drops out of pipeline scope entirely.** Pipeline-scope only — the original ClawFeed product surface stays free to use OpenClaw. The brief pipeline no longer touches OpenClaw at all.
+- **Phase numbering**: Step 12 (frontier compose, ~3 commits: 12a provider, 12b wiring, 12c smoke) lands BEFORE Phase 6b (launchd schedule, ~1 commit) so the first scheduled run uses frontier compose. Phase 6c (failure-mode runbook) lands last and exercises the three-tier fallback chain end-to-end.
+- **No code in this entry.** The audit trail records the decision and reasoning; the implementation commits will follow with `feat(intel): gemini-cli provider (step 12a)`, etc.
+- **Test baseline preserved**: 814/814 pass; ruff clean. Nothing touched yet.
 
 ### 2026-05-15 — Retention helpers + cleanup CLI (Phase 6a)
 - First Phase-6 increment: keeps the worker DB from growing unbounded under indefinite daily operation. Without it, ~700+ raw_items + 60+ llm_calls land per day; over 3 months that's ~60-90K + ~5-10K rows accumulating with no recovery path short of manual SQL. The architecture-doc retention policy (raw items 30-90 days; llm calls 30 days, compressed after 90) becomes enforceable via a small CLI an operator runs interactively or wires into cron.
