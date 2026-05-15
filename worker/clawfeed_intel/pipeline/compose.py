@@ -520,8 +520,6 @@ def _humanize_category(slug: str) -> str:
     return " ".join(part.capitalize() for part in slug.replace("-", "_").split("_"))
 
 
-# Module-level dunder so the package re-exports the public surface
-# matching the relevance / summary modules' shape.
 # ── Async orchestration ──────────────────────────────────────────────────────
 
 

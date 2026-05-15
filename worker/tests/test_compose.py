@@ -11,22 +11,26 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import closing
+from typing import Any
 
+import httpx
 import pytest
 
 from clawfeed_intel import db as worker_db
+from clawfeed_intel.llm import LLMClient, RetryConfig, RoutingConfig
 from clawfeed_intel.llm.schemas import ClusterSummaryPayload
 from clawfeed_intel.pipeline.compose import (
     PROMPT_VERSION,
     ComposeItem,
     ComposeOutputError,
     build_compose_messages,
+    compose_brief,
     normalize_compose_output,
     render_empty_brief,
     render_fallback_brief,
 )
 from clawfeed_intel.runs import Coverage
-from clawfeed_intel.sources import CategoryPlan
+from clawfeed_intel.sources import CategoryPlan, ProfileConfig, SourcePlan
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -804,14 +808,6 @@ def test_iter_summarized_empty_for_run_without_summaries(temp_db) -> None:
 
 
 # ── Orchestration fixtures (step 11b) ─────────────────────────────────────────
-
-
-import httpx  # noqa: E402  (orchestration imports kept beside their tests)
-from typing import Any  # noqa: E402
-
-from clawfeed_intel.llm import LLMClient, RetryConfig, RoutingConfig  # noqa: E402
-from clawfeed_intel.pipeline.compose import compose_brief  # noqa: E402
-from clawfeed_intel.sources import ProfileConfig, SourcePlan  # noqa: E402
 
 
 @pytest.fixture
