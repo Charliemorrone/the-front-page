@@ -1,16 +1,21 @@
 """ClawFeed Intelligence CLI.
 
-Phase 1 surface:
-    clawfeed-intel doctor             health-check vMLX, OpenClaw, DB
-    clawfeed-intel run daily          run a daily brief (24h window)
-    clawfeed-intel cleanup            prune old raw_items + llm_calls
+Phase 1 + Phase 6 surface:
+    clawfeed-intel doctor              health-check vMLX, DB
+    clawfeed-intel run daily           run a daily brief (24h window)
+    clawfeed-intel cleanup             prune old raw_items + llm_calls
+    clawfeed-intel cron install        install the 06:15 launchd job
+    clawfeed-intel cron uninstall      remove the launchd job
+    clawfeed-intel cron status         report whether the job is loaded
 
 `doctor` is the canonical "is the system runnable" probe. It exits non-zero
 if any check fails so a cron job can short-circuit cleanly before kicking
 off a daily run. `cleanup` is the retention complement — keeps the DB
 from growing unbounded over indefinite daily operation per the
 architecture-doc retention policy (raw items: 30-90 days; llm calls:
-30 days).
+30 days). `cron` registers the macOS launchd LaunchAgent that fires
+the daily brief at 06:15 local time (architecture-doc Phase 6b; the
+2026-05-15 amendment moved this from OpenClaw cron to launchd).
 """
 
 from __future__ import annotations
@@ -22,7 +27,7 @@ import os
 import sys
 from contextlib import closing
 
-from . import __version__, db, doctor
+from . import __version__, db, doctor, launchagent
 from .llm import load_routing
 from .paths import DB_PATH, REPO_ROOT
 from .pipeline.orchestrator import run_daily
@@ -193,6 +198,111 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_cron_install(args: argparse.Namespace) -> int:
+    """Install (or preview) the launchd LaunchAgent for the daily brief.
+
+    Default mode is dry-run: render the plist, print where it would be
+    written, and exit 0 without touching the filesystem or launchd.
+    ``--install`` is the explicit opt-in to the destructive operation
+    (write the plist + ``launchctl bootstrap``). Mirrors Phase 6a's
+    cleanup posture — destructive-default-off keeps an accidental
+    invocation from registering a scheduled job.
+
+    ``--hour`` / ``--minute`` let an operator shift the fire time
+    without editing source; defaults are 06:15 per the architecture-
+    doc's "Daily Schedule" section.
+
+    Exit code 0 on success (install or dry-run); non-zero only on
+    unexpected errors (plist write failed, launchctl returned an
+    error message worth surfacing).
+    """
+    plist_text = launchagent.render_plist(hour=args.hour, minute=args.minute)
+    target = launchagent.plist_path()
+
+    if not args.install:
+        print(f"would write LaunchAgent to: {target}")
+        print(f"would invoke: launchctl bootstrap {launchagent.gui_domain_target()} {target}")
+        print()
+        print("--- plist preview ---")
+        print(plist_text)
+        print("(re-run with --install to actually register)")
+        return 0
+
+    launchagent.ensure_log_dir()
+    written = launchagent.write_plist_atomic(plist_text)
+    print(f"wrote {written}")
+
+    # Bootout first — `bootstrap` of an already-loaded service is an
+    # error on macOS. Treat bootout-failure as a soft "wasn't loaded";
+    # only bootstrap-failure is a real problem.
+    launchagent.bootout_agent()
+    result = launchagent.bootstrap_agent(written)
+    if result.returncode != 0:
+        print(f"launchctl bootstrap failed (exit {result.returncode})", file=sys.stderr)
+        if result.stderr:
+            print(result.stderr.rstrip(), file=sys.stderr)
+        return 1
+    print(f"loaded {launchagent.gui_domain_label()}")
+    return 0
+
+
+def cmd_cron_uninstall(args: argparse.Namespace) -> int:
+    """Remove (or preview) the launchd LaunchAgent.
+
+    Default mode is dry-run: print what would be removed. ``--remove``
+    actually unloads via ``launchctl bootout`` and deletes the plist
+    file. Both operations are idempotent — uninstalling when nothing
+    is installed prints a friendly message and returns 0.
+    """
+    target = launchagent.plist_path()
+    installed = target.is_file()
+
+    if not args.remove:
+        if installed:
+            print(f"would invoke: launchctl bootout {launchagent.gui_domain_label()}")
+            print(f"would remove: {target}")
+            print("(re-run with --remove to actually uninstall)")
+        else:
+            print(f"no LaunchAgent installed at {target}")
+        return 0
+
+    if not installed:
+        print(f"no LaunchAgent installed at {target}")
+        return 0
+
+    # bootout is best-effort — the plist may have been hand-removed
+    # from launchd already; in that case bootout returns non-zero but
+    # we still want to remove the file.
+    launchagent.bootout_agent()
+    target.unlink()
+    print(f"removed {target}")
+    return 0
+
+
+def cmd_cron_status(_args: argparse.Namespace) -> int:
+    """Report whether the LaunchAgent is installed + launchctl's view.
+
+    Always returns exit 0; the printed status is the contract.
+    """
+    target = launchagent.plist_path()
+    if not target.is_file():
+        print(f"not installed (no plist at {target})")
+        return 0
+    print(f"installed at {target}")
+    result = launchagent.print_agent()
+    if result.returncode == 0:
+        print(f"launchctl state for {launchagent.gui_domain_label()}:")
+        print(result.stdout.rstrip())
+    else:
+        print(
+            f"plist present but launchctl print returned {result.returncode} "
+            "(agent may not be loaded — try `cron install --install`)"
+        )
+        if result.stderr:
+            print(result.stderr.rstrip())
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="clawfeed-intel")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -231,6 +341,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="actually delete (default: dry-run, print counts only)",
     )
 
+    cron = sub.add_parser(
+        "cron",
+        help="register/unregister the macOS launchd daily-brief schedule",
+    )
+    cron_sub = cron.add_subparsers(dest="cron_action", required=True)
+
+    cron_install = cron_sub.add_parser(
+        "install",
+        help="install the LaunchAgent (default: dry-run, --install to write)",
+    )
+    cron_install.add_argument(
+        "--install",
+        action="store_true",
+        help="actually write the plist + launchctl bootstrap (default: dry-run)",
+    )
+    cron_install.add_argument(
+        "--hour", type=int, default=6, help="fire-time hour 0-23 (default: 6)"
+    )
+    cron_install.add_argument(
+        "--minute", type=int, default=15, help="fire-time minute 0-59 (default: 15)"
+    )
+
+    cron_uninstall = cron_sub.add_parser(
+        "uninstall",
+        help="remove the LaunchAgent (default: dry-run, --remove to delete)",
+    )
+    cron_uninstall.add_argument(
+        "--remove",
+        action="store_true",
+        help="actually launchctl bootout + delete the plist (default: dry-run)",
+    )
+
+    cron_sub.add_parser("status", help="report whether the LaunchAgent is loaded")
+
     return parser
 
 
@@ -245,6 +389,13 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_run_daily(args)
     if args.cmd == "cleanup":
         return cmd_cleanup(args)
+    if args.cmd == "cron":
+        if args.cron_action == "install":
+            return cmd_cron_install(args)
+        if args.cron_action == "uninstall":
+            return cmd_cron_uninstall(args)
+        if args.cron_action == "status":
+            return cmd_cron_status(args)
 
     parser.print_help()
     return 2
