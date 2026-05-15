@@ -766,6 +766,101 @@ def iter_pending_clusters_with_members(
     yield current_id, current_title, current_members
 
 
+def iter_kept_clusters_with_members(
+    conn: sqlite3.Connection,
+    run_id: int,
+) -> Iterator[tuple[int, str, str | None, list[sqlite3.Row]]]:
+    """Yield ``(cluster_id, title, category, members)`` for each kept cluster.
+
+    Mirrors :func:`iter_pending_clusters_with_members` but filters by
+    ``status='kept'`` (the post-relevance-filter shape) and yields the
+    cluster's ``category`` (assigned by the relevance filter) so the
+    summary prompt can render the matching :class:`CategoryPlan`.
+    Members carry ``canonical_url``, ``excerpt``, ``content``, ``author``,
+    ``published_at`` so the summary prompt can surface trafilatura-
+    extracted bodies in addition to the fetcher excerpts.
+
+    Sorted by ``cluster_id ASC, raw_items.id ASC`` so the smallest-id
+    member is always the representative (the clustering layer's tie-
+    break rule). The query is one round-trip; grouping happens in
+    Python — matches the relevance-filter loader's shape.
+
+    Replay-safe: a re-run after a partial step-10 failure picks up only
+    clusters still at ``'kept'``. Clusters already advanced to
+    ``'summarized'`` aren't re-processed, preserving their
+    ``item_summaries`` rows.
+    """
+    rows = conn.execute(
+        """
+        SELECT ic.id            AS cluster_id,
+               ic.title          AS title,
+               ic.category       AS category,
+               ri.id             AS raw_item_id,
+               ri.title          AS member_title,
+               ri.canonical_url  AS canonical_url,
+               ri.excerpt        AS excerpt,
+               ri.content        AS content,
+               ri.author         AS author,
+               ri.published_at   AS published_at
+          FROM item_clusters ic
+          JOIN cluster_items ci ON ci.cluster_id = ic.id
+          JOIN raw_items     ri ON ri.id = ci.raw_item_id
+         WHERE ic.run_id = ?
+           AND ic.status = 'kept'
+         ORDER BY ic.id ASC, ri.id ASC
+        """,
+        (run_id,),
+    ).fetchall()
+
+    if not rows:
+        return
+
+    current_id = rows[0]["cluster_id"]
+    current_title = rows[0]["title"] or ""
+    current_category = rows[0]["category"]
+    current_members: list[sqlite3.Row] = []
+    for row in rows:
+        if row["cluster_id"] != current_id:
+            yield current_id, current_title, current_category, current_members
+            current_id = row["cluster_id"]
+            current_title = row["title"] or ""
+            current_category = row["category"]
+            current_members = []
+        current_members.append(row)
+    yield current_id, current_title, current_category, current_members
+
+
+def advance_cluster_to_summarized(
+    conn: sqlite3.Connection,
+    cluster_id: int,
+) -> None:
+    """Move one cluster from ``status='kept'`` to ``'summarized'``.
+
+    Distinct from :func:`update_cluster_verdict` because the
+    ``filtered_out → summarized`` transition is never valid: only
+    ``'kept'`` clusters get a summary written, so this helper enforces
+    the source-state precondition in SQL. ``cursor.rowcount == 0``
+    surfaces both "cluster missing" and "wrong starting state" as a
+    single :class:`LookupError` — the orchestration layer treats that
+    as a per-cluster degradation and continues.
+
+    Raises:
+        LookupError: cluster row missing or not in ``'kept'``.
+    """
+    with transaction(conn):
+        cur = conn.execute(
+            """
+            UPDATE item_clusters
+               SET status = 'summarized'
+             WHERE id = ?
+               AND status = 'kept'
+            """,
+            (cluster_id,),
+        )
+        if cur.rowcount == 0:
+            raise LookupError(f"item_clusters row {cluster_id} not in 'kept' state (or missing)")
+
+
 def update_cluster_verdict(
     conn: sqlite3.Connection,
     *,

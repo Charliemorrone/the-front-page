@@ -38,27 +38,48 @@ def _empty_fetcher_registry(monkeypatch):
 def _stub_llm_client(monkeypatch, *, keep_all: bool = True) -> None:
     """Replace ``orchestrator._build_llm_client`` with a deterministic stub.
 
-    The stub uses :class:`httpx.MockTransport` to short-circuit HTTP — no
-    live vMLX calls under unit tests. Verdict count is read from the
-    user message's "Batch of N clusters" header so the stub always
-    matches the requested batch size.
+    The stub uses :class:`httpx.MockTransport` to short-circuit HTTP —
+    no live vMLX calls under unit tests. The handler dispatches on the
+    user-message shape:
 
-    ``keep_all`` toggles between an all-keep and an all-reject response.
+    - Relevance batches start with ``"Batch of N clusters"`` → reply
+      with ``N`` verdicts.
+    - Summary calls start with ``"Cluster: ..."`` → reply with a single
+      :class:`ClusterSummaryPayload`-shaped object.
+
+    ``keep_all`` toggles the relevance verdicts between all-keep and
+    all-reject. Summary calls always return a valid (if generic)
+    payload — failures are exercised elsewhere with a dedicated stub.
     """
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         user_content = body["messages"][1]["content"]
-        batch_size = int(user_content.split("Batch of ", 1)[1].split(" ", 1)[0])
-        verdicts = [
-            {
-                "keep": keep_all,
-                "category": "scratch",
-                "score": 0.9 if keep_all else 0.1,
-                "reason": "stub verdict",
-            }
-            for _ in range(batch_size)
-        ]
+        if user_content.startswith("Batch of "):
+            batch_size = int(user_content.split("Batch of ", 1)[1].split(" ", 1)[0])
+            verdicts = [
+                {
+                    "keep": keep_all,
+                    "category": "scratch",
+                    "score": 0.9 if keep_all else 0.1,
+                    "reason": "stub verdict",
+                }
+                for _ in range(batch_size)
+            ]
+            content = json.dumps({"verdicts": verdicts})
+        else:
+            content = json.dumps(
+                {
+                    "headline": "Stub headline",
+                    "summary": "Stub summary sentence.",
+                    "why_it_matters": "",
+                    "entities": [],
+                    "key_facts": [],
+                    "caveats": [],
+                    "source_urls": [],
+                    "confidence": None,
+                }
+            )
         chat_body = {
             "id": "chatcmpl-stub",
             "object": "chat.completion",
@@ -66,10 +87,7 @@ def _stub_llm_client(monkeypatch, *, keep_all: bool = True) -> None:
             "choices": [
                 {
                     "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": json.dumps({"verdicts": verdicts}),
-                    },
+                    "message": {"role": "assistant", "content": content},
                     "finish_reason": "stop",
                 }
             ],
@@ -221,9 +239,13 @@ categories:
         )
         assert meta["coverage"]["raw_items"] == 3
         assert meta["coverage"]["clusters"] == 2
-        # Stub LLM keeps every cluster, so kept_clusters mirrors clusters.
+        # Stub LLM keeps every cluster, so kept_clusters mirrors clusters,
+        # and the summarizing stage advances every kept cluster.
         assert meta["coverage"]["kept_clusters"] == 2
+        assert meta["coverage"]["summarized_clusters"] == 2
         assert meta["coverage"]["failed_filter_batches"] == 0
+        assert meta["coverage"]["failed_summary_clusters"] == 0
+        assert meta["local_models"]["summary"]
 
         run_row = conn.execute(
             "SELECT id FROM intel_runs WHERE digest_id = ?", (digest_id,)
@@ -236,7 +258,17 @@ categories:
             "https://example.com/a",
             "https://example.com/b",
         ]
-        assert all(c["status"] == "kept" for c in clusters)
+        assert all(c["status"] == "summarized" for c in clusters)
+
+        # Each kept cluster produced exactly one item_summaries row.
+        summary_rows = conn.execute(
+            "SELECT cluster_id, headline FROM item_summaries "
+            "WHERE cluster_id IN (SELECT id FROM item_clusters WHERE run_id = ?) "
+            "ORDER BY cluster_id",
+            (run_row["id"],),
+        ).fetchall()
+        assert len(summary_rows) == 2
+        assert all(r["headline"] == "Stub headline" for r in summary_rows)
 
 
 def test_run_daily_folds_syndicated_items_via_content_hash(temp_db, monkeypatch, tmp_path):

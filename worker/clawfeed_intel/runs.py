@@ -23,10 +23,12 @@ class Coverage:
     raw_items: int = 0
     clusters: int = 0
     kept_clusters: int = 0
+    summarized_clusters: int = 0
     failed_sources: list[str] = field(default_factory=list)
     skipped_sources: list[str] = field(default_factory=list)
     plan_warnings: list[str] = field(default_factory=list)
     failed_filter_batches: int = 0
+    failed_summary_clusters: int = 0
 
     def record_success(self, source_id: str, items: int) -> None:
         self.sources_attempted += 1
@@ -63,6 +65,16 @@ class Coverage:
         ``status='pending'``.
         """
         self.failed_filter_batches += 1
+
+    def record_failed_summary_cluster(self) -> None:
+        """One cluster's summary call failed; left at ``status='kept'``.
+
+        Unlike the filter stage, summaries are per-cluster — each call is
+        independent, so a failure here degrades exactly one cluster from
+        today's brief. The cluster's unchanged ``status='kept'`` is its
+        own audit trail; a re-run picks it up via the kept-only loader.
+        """
+        self.failed_summary_clusters += 1
 
 
 @dataclass

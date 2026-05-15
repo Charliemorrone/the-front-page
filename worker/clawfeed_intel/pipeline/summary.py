@@ -25,12 +25,31 @@ Architecture-doc rules baked into the prompt:
 
 from __future__ import annotations
 
+import logging
+import sqlite3
 from dataclasses import dataclass, field
 
+from .. import db
+from ..llm import LLMClient
 from ..llm.schemas import ClusterSummaryPayload
-from ..sources import CategoryPlan
+from ..runs import Coverage
+from ..sources import CategoryPlan, SourcePlan
+
+log = logging.getLogger(__name__)
 
 PROMPT_VERSION = "summary.v1"
+
+# Structured outputs need a low temperature to keep JSON well-formed
+# under load. Same reasoning as the relevance filter — JSON-mode prompt
+# property, not a model property — so it lives at the call site.
+_SUMMARY_TEMPERATURE = 0.1
+
+# Cluster summaries can run 400-800 tokens of structured output; vMLX
+# defaults to ~1024 which truncates mid-JSON on the longer end. The
+# 9b lesson, sized one-call-at-a-time: pin generously, leave headroom
+# for the bounded-repair retry without imposing a memory burden on the
+# server.
+_SUMMARY_MAX_TOKENS = 2048
 
 
 # ── Input shape ───────────────────────────────────────────────────────────────
@@ -249,10 +268,148 @@ def parse_summary(parsed: ClusterSummaryPayload) -> ClusterSummaryPayload:
     return parsed
 
 
+def _hydrate_cluster(
+    cluster_id: int,
+    title: str,
+    category: str | None,
+    member_rows: list[sqlite3.Row],
+) -> SummaryCluster:
+    """Build a :class:`SummaryCluster` from one DB-grouped batch.
+
+    Empty bodies and authors are normalized to empty strings so the
+    pure helper's "omit empty fields" rendering rules apply uniformly,
+    regardless of which fetcher produced the underlying row.
+    """
+    members = tuple(
+        SummaryMember(
+            title=row["member_title"] or "",
+            canonical_url=row["canonical_url"] or "",
+            excerpt=row["excerpt"] or "",
+            content=row["content"] or "",
+            author=row["author"] or "",
+            published_at=row["published_at"],
+        )
+        for row in member_rows
+    )
+    return SummaryCluster(
+        cluster_id=cluster_id,
+        title=title,
+        category=category,
+        members=members,
+    )
+
+
+# ── Async orchestration ──────────────────────────────────────────────────────
+
+
+async def summarize_clusters(
+    conn: sqlite3.Connection,
+    run_id: int,
+    llm_client: LLMClient,
+    coverage: Coverage,
+    *,
+    plan: SourcePlan,
+    model: str,
+    prompt_version: str = PROMPT_VERSION,
+) -> int:
+    """Summarize every kept cluster for *run_id*; return summarized count.
+
+    Walks ``status='kept'`` clusters in id order. One
+    :meth:`LLMClient.chat_completion` per cluster (cluster summaries
+    don't share well across batches — each call needs the cluster's
+    full member content as context). Writes one ``item_summaries`` row
+    and advances ``status='summarized'`` on success.
+
+    Per-cluster failure model (the architecture-doc "failed sources
+    degrade coverage" rule extended to LLM stages, at one-cluster
+    granularity): when the LLM call raises after retries/repair, or the
+    schema validation fails, or the DB write fails, the cluster is left
+    at ``status='kept'`` and :meth:`Coverage.record_failed_summary_cluster`
+    increments. Sibling clusters are unaffected. A re-run picks up only
+    clusters still at ``'kept'`` so prior summaries survive.
+
+    ``model`` is the configured stage model (``stage_config.model`` from
+    the routing config); the orchestrator passes it down explicitly so
+    the value written to ``item_summaries.model`` matches whichever
+    flagship was actually used, not whatever the response payload
+    self-reports.
+    """
+    summarized = 0
+    for cluster_id, title, category_slug, member_rows in db.iter_kept_clusters_with_members(
+        conn, run_id
+    ):
+        if not member_rows:
+            # iter_kept_clusters_with_members shouldn't yield empty
+            # member lists (create_cluster rejects empty member sets),
+            # but skipping defensively is cheaper than raising and
+            # preserves the cluster's status for a future debugger.
+            continue
+        cluster = _hydrate_cluster(cluster_id, title, category_slug, member_rows)
+        category_plan = plan.category(category_slug) if category_slug else None
+
+        try:
+            payload = await _summarize_one(
+                llm_client, cluster, category_plan, prompt_version=prompt_version
+            )
+        except Exception as exc:
+            log.warning(
+                "run %d cluster %d: summary call failed (%s); left at 'kept'",
+                run_id,
+                cluster_id,
+                exc,
+            )
+            coverage.record_failed_summary_cluster()
+            continue
+
+        try:
+            db.create_item_summary(
+                conn,
+                cluster_id=cluster_id,
+                model=model,
+                prompt_version=prompt_version,
+                payload=payload,
+            )
+            db.advance_cluster_to_summarized(conn, cluster_id)
+        except Exception as exc:
+            log.warning(
+                "run %d cluster %d: summary persistence failed (%s); left at 'kept'",
+                run_id,
+                cluster_id,
+                exc,
+            )
+            coverage.record_failed_summary_cluster()
+            continue
+
+        summarized += 1
+
+    return summarized
+
+
+async def _summarize_one(
+    llm_client: LLMClient,
+    cluster: SummaryCluster,
+    category: CategoryPlan | None,
+    *,
+    prompt_version: str,
+) -> ClusterSummaryPayload:
+    """Run one cluster through the LLM and unpack the validated payload."""
+    messages = build_summary_messages(cluster, category)
+    result = await llm_client.chat_completion(
+        stage="cluster_summary",
+        messages=messages,
+        response_schema=ClusterSummaryPayload,
+        prompt_version=prompt_version,
+        temperature=_SUMMARY_TEMPERATURE,
+        max_tokens=_SUMMARY_MAX_TOKENS,
+    )
+    return parse_summary(result.parsed)  # type: ignore[arg-type]
+
+
 __all__ = (
     "PROMPT_VERSION",
     "SummaryCluster",
     "SummaryMember",
     "build_summary_messages",
     "parse_summary",
+    "summarize_clusters",
 )
