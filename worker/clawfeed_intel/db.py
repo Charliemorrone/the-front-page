@@ -979,6 +979,57 @@ def create_item_summary(
         return int(cur.lastrowid or 0)
 
 
+def iter_summarized_clusters_with_summary(
+    conn: sqlite3.Connection,
+    run_id: int,
+) -> Iterator[sqlite3.Row]:
+    """Yield one row per summarized cluster joined to its latest summary.
+
+    Used by the final composer (step 11) to build the prompt input.
+    Filters by ``status='summarized'`` (only clusters that survived
+    relevance + summary stages enter the brief). When multiple
+    ``item_summaries`` rows exist for a cluster (e.g. after a prompt
+    version bump), the largest id wins — that's the most recent write
+    and the one the composer should weave into the brief.
+
+    Sorted by ``relevance_score DESC, cluster_id ASC`` so the composer
+    sees higher-signal items first; NULL scores sort last. The list
+    fields (``entities``, ``key_facts``, ``caveats``, ``source_urls``)
+    remain TEXT JSON strings on the row — the pipeline layer
+    deserializes them via :func:`json.loads` when building
+    :class:`pipeline.compose.ComposeItem` instances.
+    """
+    rows = conn.execute(
+        """
+        SELECT ic.id              AS cluster_id,
+               ic.category        AS category,
+               ic.relevance_score AS relevance_score,
+               s.headline         AS headline,
+               s.summary          AS summary,
+               s.why_it_matters   AS why_it_matters,
+               s.entities         AS entities,
+               s.key_facts        AS key_facts,
+               s.caveats          AS caveats,
+               s.confidence       AS confidence,
+               s.source_urls      AS source_urls
+          FROM item_clusters ic
+          JOIN item_summaries s ON s.cluster_id = ic.id
+         WHERE ic.run_id = ?
+           AND ic.status = 'summarized'
+           AND s.id = (
+               SELECT MAX(s2.id)
+                 FROM item_summaries s2
+                WHERE s2.cluster_id = ic.id
+           )
+         ORDER BY (ic.relevance_score IS NULL) ASC,
+                  ic.relevance_score DESC,
+                  ic.id ASC
+        """,
+        (run_id,),
+    )
+    yield from rows
+
+
 # ── llm_calls ─────────────────────────────────────────────────────────────────
 
 

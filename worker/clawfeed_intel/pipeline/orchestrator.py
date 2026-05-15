@@ -6,10 +6,7 @@ The orchestrator drives a run through the lifecycle states declared in
     pending → fetching → filtering → summarizing → composing → published
 
 Each state transition is durable in the DB so a partial run is observable from
-the dashboard. Stage implementations land incrementally; until they exist this
-module produces a skeleton brief whose only purpose is to prove the spine —
-run row created, states walked, digest published, ``intel_runs.digest_id``
-linked.
+the dashboard.
 """
 
 from __future__ import annotations
@@ -25,32 +22,11 @@ from ..runs import RunMetadata
 from ..sources import build_source_plan
 from ..timewindow import window_for
 from .cluster import cluster_run
+from .compose import compose_brief
 from .relevance import filter_clusters
 from .summary import summarize_clusters
 
 log = logging.getLogger(__name__)
-
-
-_STUB_BRIEF_TEMPLATE = """# Daily Intelligence Brief — {date}
-
-_This brief was produced by the run-lifecycle skeleton. Fetcher and
-intelligence stages have not been implemented yet; the skeleton exists to
-prove that runs walk through every state and publish a real digest._
-
-## Coverage
-
-- Sources attempted: {sources_attempted}
-- Sources succeeded: {sources_succeeded}
-- Raw items: {raw_items}
-- Event clusters: {clusters}
-- Kept clusters: {kept_clusters}
-- Summarized clusters: {summarized_clusters}
-- Failed sources: {failed_sources}
-- Failed filter batches: {failed_filter_batches}
-- Failed summary clusters: {failed_summary_clusters}
-
-_Run id: {run_id}. Window: {window_start} → {window_end}._
-"""
 
 
 def run_daily(window_spec: str, *, conn: sqlite3.Connection | None = None) -> int:
@@ -158,13 +134,33 @@ def _drive_run(conn: sqlite3.Connection, run_id: int, metadata: RunMetadata) -> 
 
     db.advance_run_status(conn, run_id, "composing")
     log.info("run %d: → composing", run_id)
-    markdown = _compose_stub(metadata)
+    compose_stage_config = routing.resolve("final_compose")
+    compose_result = asyncio.run(
+        compose_brief(
+            conn,
+            run_id,
+            llm_client,
+            plan=plan,
+            coverage=metadata.coverage,
+            window_start=metadata.window_start,
+            window_end=metadata.window_end,
+            model=compose_stage_config.model,
+        )
+    )
+    metadata.composition_provider = compose_result.provider_tag
+    metadata.composition_model = compose_result.model
+    log.info(
+        "run %d: composed (provider=%s, model=%s)",
+        run_id,
+        compose_result.provider_tag,
+        compose_result.model,
+    )
 
     db.update_run_metadata(conn, run_id, metadata.as_json())
     digest_id = db.create_digest(
         conn,
         digest_type="daily",
-        content=markdown,
+        content=compose_result.markdown,
         metadata=metadata.as_json(),
     )
     db.finish_run(conn, run_id, status="published", digest_id=digest_id)
@@ -185,22 +181,3 @@ def _build_llm_client(
     needing to refactor :func:`_drive_run`'s control flow.
     """
     return LLMClient(routing, conn=conn, run_id=run_id)
-
-
-def _compose_stub(metadata: RunMetadata) -> str:
-    coverage = metadata.coverage
-    return _STUB_BRIEF_TEMPLATE.format(
-        date=metadata.window_end[:10],
-        run_id=metadata.run_id,
-        window_start=metadata.window_start,
-        window_end=metadata.window_end,
-        sources_attempted=coverage.sources_attempted,
-        sources_succeeded=coverage.sources_succeeded,
-        raw_items=coverage.raw_items,
-        clusters=coverage.clusters,
-        kept_clusters=coverage.kept_clusters,
-        summarized_clusters=coverage.summarized_clusters,
-        failed_sources=", ".join(coverage.failed_sources) or "none",
-        failed_filter_batches=coverage.failed_filter_batches,
-        failed_summary_clusters=coverage.failed_summary_clusters,
-    )
