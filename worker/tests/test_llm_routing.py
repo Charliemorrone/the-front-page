@@ -214,3 +214,137 @@ def test_negative_batch_size_rejected(tmp_path: Path, base_config: dict[str, Any
     path = _write_yaml(tmp_path / "routing.yaml", base_config)
     with pytest.raises(ValidationError):
         load_routing(path)
+
+
+# ── Step 12b: gemini_cli provider + fallback shape ──────────────────────────
+
+
+def test_gemini_cli_provider_loads(tmp_path: Path, base_config: dict[str, Any]) -> None:
+    """The shipped default config declares the gemini_cli provider with
+    every field the runtime needs to spawn the subprocess.
+    """
+    base_config["providers"]["gemini_cli"] = {
+        "executable_path": "/usr/bin/node",
+        "script_path": "/usr/bin/gemini",
+        "approval_mode": "plan",
+        "output_format": "stream-json",
+        "idle_timeout_seconds": 30,
+        "hard_timeout_seconds": 120,
+        "retries": 2,
+        "retry_backoff_seconds": 5,
+    }
+    config = load_routing(_write_yaml(tmp_path / "routing.yaml", base_config))
+    gem = config.providers.gemini_cli
+    assert gem is not None
+    assert gem.script_path == "/usr/bin/gemini"
+    assert gem.executable_path == "/usr/bin/node"
+    assert gem.idle_timeout_seconds == 30
+    assert gem.hard_timeout_seconds == 120
+    assert gem.retries == 2
+
+
+def test_gemini_cli_provider_optional(tmp_path: Path, base_config: dict[str, Any]) -> None:
+    """A vmlx-only deployment still loads cleanly without the provider."""
+    config = load_routing(_write_yaml(tmp_path / "routing.yaml", base_config))
+    assert config.providers.gemini_cli is None
+
+
+def test_stage_routes_to_gemini_cli_provider(tmp_path: Path, base_config: dict[str, Any]) -> None:
+    """A stage may declare ``provider: gemini_cli`` after Step 12b."""
+    base_config["providers"]["gemini_cli"] = {
+        "script_path": "/usr/bin/gemini",
+    }
+    base_config["stages"]["final_compose"] = {
+        "provider": "gemini_cli",
+        "model": "gemini-3-pro",
+        "timeout_seconds": 300,
+    }
+    config = load_routing(_write_yaml(tmp_path / "routing.yaml", base_config))
+    stage = config.resolve("final_compose")
+    assert stage.provider == "gemini_cli"
+    assert stage.model == "gemini-3-pro"
+
+
+def test_stage_fallback_parses(tmp_path: Path, base_config: dict[str, Any]) -> None:
+    """``FallbackConfig`` accepts provider + model with an optional timeout."""
+    base_config["stages"]["final_compose"] = {
+        "provider": "vmlx",
+        "model": "primary-model",
+        "timeout_seconds": 300,
+        "fallback": {
+            "provider": "vmlx",
+            "model": "fallback-model",
+            "timeout_seconds": 600,
+        },
+    }
+    config = load_routing(_write_yaml(tmp_path / "routing.yaml", base_config))
+    fb = config.resolve("final_compose").fallback
+    assert fb is not None
+    assert fb.provider == "vmlx"
+    assert fb.model == "fallback-model"
+    assert fb.timeout_seconds == 600
+
+
+def test_stage_fallback_timeout_optional(tmp_path: Path, base_config: dict[str, Any]) -> None:
+    """``fallback.timeout_seconds`` omitted → ``None`` (compose layer inherits parent)."""
+    base_config["stages"]["final_compose"] = {
+        "provider": "vmlx",
+        "model": "primary",
+        "timeout_seconds": 300,
+        "fallback": {"provider": "vmlx", "model": "fb"},
+    }
+    config = load_routing(_write_yaml(tmp_path / "routing.yaml", base_config))
+    assert config.resolve("final_compose").fallback.timeout_seconds is None
+
+
+def test_stage_fallback_zero_timeout_rejected(tmp_path: Path, base_config: dict[str, Any]) -> None:
+    base_config["stages"]["final_compose"] = {
+        "provider": "vmlx",
+        "model": "x",
+        "timeout_seconds": 300,
+        "fallback": {"provider": "vmlx", "model": "fb", "timeout_seconds": 0},
+    }
+    with pytest.raises(ValidationError):
+        load_routing(_write_yaml(tmp_path / "routing.yaml", base_config))
+
+
+def test_stage_retries_field_optional_and_validated(
+    tmp_path: Path, base_config: dict[str, Any]
+) -> None:
+    base_config["stages"]["final_compose"] = {
+        "provider": "gemini_cli",
+        "model": "gemini-3-pro",
+        "timeout_seconds": 300,
+        "retries": 2,
+        "retry_backoff_seconds": 7.5,
+    }
+    base_config["providers"]["gemini_cli"] = {"script_path": "/x"}
+    config = load_routing(_write_yaml(tmp_path / "routing.yaml", base_config))
+    stage = config.resolve("final_compose")
+    assert stage.retries == 2
+    assert stage.retry_backoff_seconds == 7.5
+
+
+def test_stage_negative_retries_rejected(tmp_path: Path, base_config: dict[str, Any]) -> None:
+    base_config["stages"]["final_compose"] = {
+        "provider": "vmlx",
+        "model": "x",
+        "timeout_seconds": 300,
+        "retries": -1,
+    }
+    with pytest.raises(ValidationError):
+        load_routing(_write_yaml(tmp_path / "routing.yaml", base_config))
+
+
+def test_default_config_routes_final_compose_to_gemini_cli() -> None:
+    """The shipped default config (post-Step-12b) routes final_compose
+    through ``gemini_cli`` with a vmlx fallback declared. Pinning this
+    catches accidental regression of the production routing.
+    """
+    config = load_routing()
+    stage = config.resolve("final_compose")
+    assert stage.provider == "gemini_cli"
+    assert stage.model == "gemini-3-pro"
+    assert stage.fallback is not None
+    assert stage.fallback.provider == "vmlx"
+    assert config.providers.gemini_cli is not None

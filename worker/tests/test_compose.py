@@ -1181,3 +1181,323 @@ async def test_compose_brief_surfaces_citation_urls_in_prompt(temp_db, routing) 
 
     user = captured[0]["messages"][1]["content"]
     assert "https://distinctive.example/source-1" in user
+
+
+# ── Step 12b: three-tier fallback chain ─────────────────────────────────────
+
+
+@pytest.fixture
+def routing_with_fallback() -> RoutingConfig:
+    """vmlx primary + vmlx fallback. Both go through MockTransport so a
+    handler controlling per-model responses can drive Tier-1-fails /
+    Tier-2-succeeds (and the inverse) without spawning subprocesses.
+    """
+    return RoutingConfig.model_validate(
+        {
+            "providers": {"vmlx": {"base_url": "http://127.0.0.1:8080/v1"}},
+            "stages": {
+                "final_compose": {
+                    "provider": "vmlx",
+                    "model": "primary-model",
+                    "timeout_seconds": 30,
+                    "fallback": {
+                        "provider": "vmlx",
+                        "model": "fallback-model",
+                    },
+                },
+            },
+        }
+    )
+
+
+async def test_compose_three_tier_tier1_success_uses_primary_model(
+    temp_db, routing_with_fallback
+) -> None:
+    """Tier 1 succeeds → ``provider_tag`` reflects the primary; Tier 2
+    is never engaged. ``model`` field carries the primary model.
+    """
+    captured: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        captured.append(body)
+        return httpx.Response(
+            200,
+            json=_chat_response(
+                content="# Daily Intelligence Brief — 2026-05-15\n\nbody\n",
+                model=body["model"],
+            ),
+        )
+
+    with closing(worker_db.connect(temp_db)) as conn:
+        run_id = _make_run(conn)
+        _seed_summarized(conn, run_id=run_id, key="https://a.example/")
+        client = _make_client(routing_with_fallback, handler, conn=conn, run_id=run_id)
+
+        result = await compose_brief(
+            conn,
+            run_id,
+            client,
+            plan=_make_plan(),
+            coverage=Coverage(summarized_clusters=1),
+            window_start="x",
+            window_end="2026-05-15T00:00:00+00:00",
+            model="orchestrator-passed-model",
+        )
+
+    # Only one HTTP call — Tier 2 not engaged.
+    assert len(captured) == 1
+    assert captured[0]["model"] == "primary-model"
+    # Tag is "vmlx_fallback" because primary provider was vmlx.
+    assert result.provider_tag == "vmlx_fallback"
+    assert result.model == "primary-model"
+
+
+async def test_compose_three_tier_tier1_fails_tier2_succeeds(
+    temp_db, routing_with_fallback
+) -> None:
+    """Tier 1 fails → Tier 2 dispatched against fallback model →
+    ``provider_tag`` stays ``"vmlx_fallback"`` and ``model`` carries
+    the fallback model (so dashboard can see which one ran).
+    """
+    captured: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        captured.append(body)
+        if body["model"] == "primary-model":
+            return httpx.Response(500)
+        return httpx.Response(
+            200,
+            json=_chat_response(
+                content="# Daily Intelligence Brief — 2026-05-15\n\nfallback body\n",
+                model="fallback-model",
+            ),
+        )
+
+    with closing(worker_db.connect(temp_db)) as conn:
+        run_id = _make_run(conn)
+        _seed_summarized(conn, run_id=run_id, key="https://a.example/")
+        client = _make_client(routing_with_fallback, handler, conn=conn, run_id=run_id)
+
+        result = await compose_brief(
+            conn,
+            run_id,
+            client,
+            plan=_make_plan(),
+            coverage=Coverage(summarized_clusters=1),
+            window_start="x",
+            window_end="2026-05-15T00:00:00+00:00",
+            model="orchestrator-passed-model",
+        )
+
+    models_tried = [c["model"] for c in captured]
+    assert "primary-model" in models_tried
+    assert "fallback-model" in models_tried
+    assert result.provider_tag == "vmlx_fallback"
+    assert result.model == "fallback-model"
+    assert "fallback body" in result.markdown
+
+
+async def test_compose_three_tier_both_tiers_fail_goes_to_deterministic(
+    temp_db, routing_with_fallback
+) -> None:
+    """Tier 1 fails AND Tier 2 fails → Tier 3 deterministic brief +
+    ``provider_tag = "local_stub_failed"``. The deterministic brief
+    contains the cluster's headline so we know it wasn't a no-op.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    with closing(worker_db.connect(temp_db)) as conn:
+        run_id = _make_run(conn)
+        _seed_summarized(
+            conn,
+            run_id=run_id,
+            key="https://a.example/",
+            headline="A real headline",
+        )
+        client = _make_client(routing_with_fallback, handler, conn=conn, run_id=run_id)
+
+        result = await compose_brief(
+            conn,
+            run_id,
+            client,
+            plan=_make_plan(),
+            coverage=Coverage(summarized_clusters=1),
+            window_start="x",
+            window_end="2026-05-15T00:00:00+00:00",
+            model="orchestrator-passed-model",
+        )
+
+    assert result.provider_tag == "local_stub_failed"
+    assert "A real headline" in result.markdown
+    # The orchestrator-passed model survives in the result for Tier 3
+    # (no specific LLM ran successfully — the original parameter is what
+    # the digest metadata stamps).
+    assert result.model == "orchestrator-passed-model"
+
+
+async def test_compose_no_fallback_tier1_fail_goes_straight_to_deterministic(
+    temp_db, routing
+) -> None:
+    """When ``fallback`` is not declared on the stage, a Tier-1 failure
+    bypasses Tier 2 entirely and renders the deterministic brief.
+
+    Preserves the Phase-1 contract for vmlx-only deployments.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    with closing(worker_db.connect(temp_db)) as conn:
+        run_id = _make_run(conn)
+        _seed_summarized(
+            conn,
+            run_id=run_id,
+            key="https://a.example/",
+            headline="Headline that survives",
+        )
+        client = _make_client(routing, handler, conn=conn, run_id=run_id)
+
+        result = await compose_brief(
+            conn,
+            run_id,
+            client,
+            plan=_make_plan(),
+            coverage=Coverage(summarized_clusters=1),
+            window_start="x",
+            window_end="2026-05-15T00:00:00+00:00",
+            model="stub-compose-model",
+        )
+
+    assert result.provider_tag == "local_stub_failed"
+    assert "Headline that survives" in result.markdown
+
+
+async def test_compose_tier1_gemini_cli_success_tag(
+    monkeypatch: pytest.MonkeyPatch, temp_db
+) -> None:
+    """When the primary stage routes to gemini_cli and Tier 1 succeeds,
+    ``provider_tag`` is ``"gemini_cli"`` — the dashboard signal that
+    a frontier model produced the brief.
+    """
+    from clawfeed_intel.llm.gemini_cli import GeminiCliResult
+
+    async def fake_completion(config, *, messages, model):
+        return GeminiCliResult(
+            content="# Daily Intelligence Brief — 2026-05-15\n\nFrontier prose.\n",
+            model=model,
+            latency_ms=10,
+            prompt_tokens=1,
+            completion_tokens=1,
+        )
+
+    monkeypatch.setattr("clawfeed_intel.llm.client.gemini_cli_completion", fake_completion)
+
+    routing_gemini = RoutingConfig.model_validate(
+        {
+            "providers": {
+                "vmlx": {"base_url": "http://127.0.0.1:8080/v1"},
+                "gemini_cli": {"script_path": "/fake/gemini"},
+            },
+            "stages": {
+                "final_compose": {
+                    "provider": "gemini_cli",
+                    "model": "gemini-3-pro",
+                    "timeout_seconds": 300,
+                    "fallback": {"provider": "vmlx", "model": "fallback-vmlx"},
+                },
+            },
+        }
+    )
+
+    with closing(worker_db.connect(temp_db)) as conn:
+        run_id = _make_run(conn)
+        _seed_summarized(conn, run_id=run_id, key="https://a.example/")
+        client = LLMClient(routing_gemini, conn=conn, run_id=run_id)
+
+        result = await compose_brief(
+            conn,
+            run_id,
+            client,
+            plan=_make_plan(),
+            coverage=Coverage(summarized_clusters=1),
+            window_start="x",
+            window_end="2026-05-15T00:00:00+00:00",
+            model="gemini-3-pro",
+        )
+
+    assert result.provider_tag == "gemini_cli"
+    assert result.model == "gemini-3-pro"
+    assert "Frontier prose" in result.markdown
+
+
+async def test_compose_tier1_gemini_fail_tier2_vmlx_recovery(
+    monkeypatch: pytest.MonkeyPatch, temp_db
+) -> None:
+    """Gemini Tier 1 fails → vMLX Tier 2 recovers → ``provider_tag`` is
+    ``"vmlx_fallback"``. This is the load-bearing reliability assertion
+    behind the architecture-doc Phase-6 rule "a partially degraded run
+    still publishes a useful brief and clearly names what degraded."
+    """
+    from clawfeed_intel.llm.gemini_cli import GeminiCliStallError
+
+    async def fake_completion(config, *, messages, model):
+        raise GeminiCliStallError("simulated stall")
+
+    monkeypatch.setattr("clawfeed_intel.llm.client.gemini_cli_completion", fake_completion)
+
+    routing_gemini = RoutingConfig.model_validate(
+        {
+            "providers": {
+                "vmlx": {"base_url": "http://127.0.0.1:8080/v1"},
+                "gemini_cli": {"script_path": "/fake/gemini"},
+            },
+            "stages": {
+                "final_compose": {
+                    "provider": "gemini_cli",
+                    "model": "gemini-3-pro",
+                    "timeout_seconds": 300,
+                    "fallback": {"provider": "vmlx", "model": "fallback-vmlx"},
+                },
+            },
+        }
+    )
+
+    def vmlx_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json=_chat_response(
+                content="# Daily Intelligence Brief — 2026-05-15\n\nvMLX recovered.\n",
+                model=body["model"],
+            ),
+        )
+
+    with closing(worker_db.connect(temp_db)) as conn:
+        run_id = _make_run(conn)
+        _seed_summarized(conn, run_id=run_id, key="https://a.example/")
+        client = LLMClient(
+            routing_gemini,
+            transport=httpx.MockTransport(vmlx_handler),
+            conn=conn,
+            run_id=run_id,
+            retry_config=RetryConfig(max_attempts=1, wait_min_seconds=0, wait_max_seconds=0),
+        )
+
+        result = await compose_brief(
+            conn,
+            run_id,
+            client,
+            plan=_make_plan(),
+            coverage=Coverage(summarized_clusters=1),
+            window_start="x",
+            window_end="2026-05-15T00:00:00+00:00",
+            model="gemini-3-pro",
+        )
+
+    assert result.provider_tag == "vmlx_fallback"
+    assert result.model == "fallback-vmlx"
+    assert "vMLX recovered" in result.markdown

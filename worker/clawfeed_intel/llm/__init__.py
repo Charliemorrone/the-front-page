@@ -11,8 +11,20 @@ logging. Step 11 adds the openclaw provider for final composition.
 """
 
 from .client import CallResult, LLMClient, LLMSchemaError, RetryConfig
+from .gemini_cli import (
+    GeminiCliError,
+    GeminiCliExitError,
+    GeminiCliOutputError,
+    GeminiCliProviderConfig as GeminiCliRuntimeConfig,
+    GeminiCliResult,
+    GeminiCliStallError,
+    GeminiCliTimeoutError,
+    gemini_cli_completion,
+)
 from .routing import (
     DEFAULT_CONFIG_PATH,
+    FallbackConfig,
+    GeminiCliProviderConfig,
     ProvidersConfig,
     RoutingConfig,
     StageConfig,
@@ -25,6 +37,15 @@ __all__ = [
     "CallResult",
     "ClusterSummaryPayload",
     "DEFAULT_CONFIG_PATH",
+    "FallbackConfig",
+    "GeminiCliError",
+    "GeminiCliExitError",
+    "GeminiCliOutputError",
+    "GeminiCliProviderConfig",
+    "GeminiCliResult",
+    "GeminiCliRuntimeConfig",
+    "GeminiCliStallError",
+    "GeminiCliTimeoutError",
     "LLMClient",
     "LLMSchemaError",
     "ProvidersConfig",
@@ -34,5 +55,6 @@ __all__ = [
     "RoutingConfig",
     "StageConfig",
     "VmlxProviderConfig",
+    "gemini_cli_completion",
     "load_routing",
 ]

@@ -9,23 +9,40 @@
 #   source_planning  → Qwen/Qwen3.6-35B-A3B
 #   relevance_filter → mlx-community/Qwen3.5-122B-A10B-4bit
 #   cluster_summary  → mlx-community/Qwen3.5-122B-A10B-4bit
-#   final_compose    → openclaw / gpt-5.3-codex (with vmlx fallback)
+#   final_compose    → gemini_cli / gemini-3-pro (with vmlx Tier-2 fallback)
+#                      (2026-05-15 amendment: was openclaw/gpt-5.3-codex)
 #
 # As of 2026-05-06 the doc-target local flagships (Qwen3.5-122B-A10B-4bit,
 # ~70G; Qwen3.6-35B-A3B) are NOT on disk. Phase 1 substitutes models that
 # already live in ~/.cache/huggingface/hub/. Swapping in the doc-target
 # models when downloaded is a YAML edit — no code change.
 #
-# ── OpenClaw provider ─────────────────────────────────────────────────────
-# Step 8 ships with the vmlx provider only. The openclaw provider (gateway
-# WebSocket transport, gpt-5.3-codex) lands in step 11 (final composition).
-# Until then, final_compose is routed to vmlx so the pipeline stays runnable
-# end-to-end against local inference alone.
+# ── gemini_cli provider (Step 12b) ────────────────────────────────────────
+# Final composition routes to the Gemini CLI subprocess provider. The
+# 2026-05-15 amendment replaced the originally-planned OpenClaw gateway
+# transport — see docs/personal-intelligence-brief-architecture.md
+# "Decision 4 amendment" and the status doc's scope-changes entry for
+# the rationale. `executable_path` hardcodes the working node v25.9.0
+# binary because /opt/homebrew/opt/node@22 (first on PATH) is linked
+# against an absent simdjson.30 dylib; the gemini CLI's shebang resolves
+# via PATH and picks the broken one. Environmental fix is tracked in
+# status doc; this routing-config override is the mitigation that
+# unblocks the worker today.
 
 providers:
   vmlx:
     base_url: http://127.0.0.1:8080/v1
     api_key_env: VMLX_API_KEY
+
+  gemini_cli:
+    executable_path: /opt/homebrew/bin/node
+    script_path: /opt/homebrew/bin/gemini
+    approval_mode: plan
+    output_format: stream-json
+    idle_timeout_seconds: 60
+    hard_timeout_seconds: 300
+    retries: 1
+    retry_backoff_seconds: 10
 
 stages:
   source_planning:
@@ -45,6 +62,18 @@ stages:
     timeout_seconds: 300
 
   final_compose:
-    provider: vmlx
-    model: mlx-community/Qwen3.5-27B-4bit
+    # Tier 1: frontier compose via Gemini CLI. Architecture-doc
+    # non-negotiable: the final brief is composed by a frontier-class
+    # model. `timeout_seconds` mirrors the provider's hard_timeout for
+    # readability; the actual enforcement lives in the provider's
+    # per-line idle + wall-clock checks.
+    provider: gemini_cli
+    model: gemini-3-pro
     timeout_seconds: 300
+    fallback:
+      # Tier 2: local vMLX with the strongest cached model. The
+      # architecture-doc target is Qwen3.5-122B-A10B-4bit; until that
+      # lands on disk we route to the 27B-4bit placeholder (already
+      # validated by the 2026-05-15 compose smoke).
+      provider: vmlx
+      model: mlx-community/Qwen3.5-27B-4bit

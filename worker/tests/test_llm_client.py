@@ -891,3 +891,206 @@ async def test_retry_with_logging_records_one_row_per_logical_call(
     rows = _list_calls(conn)
     assert len(rows) == 1
     assert rows[0]["status"] == "succeeded"
+
+
+# ── Step 12b: gemini_cli dispatch via LLMClient ─────────────────────────────
+
+
+@pytest.fixture
+def routing_with_gemini() -> RoutingConfig:
+    """Routing config that has both providers and routes final_compose
+    to gemini_cli. CLI dispatch tests use this; the actual subprocess
+    is monkeypatched in each test so nothing is invoked for real.
+    """
+    return RoutingConfig.model_validate(
+        {
+            "providers": {
+                "vmlx": {"base_url": "http://127.0.0.1:8080/v1"},
+                "gemini_cli": {"script_path": "/fake/gemini"},
+            },
+            "stages": {
+                "source_planning": {
+                    "provider": "vmlx",
+                    "model": "stub-vmlx",
+                    "timeout_seconds": 30,
+                },
+                "final_compose": {
+                    "provider": "gemini_cli",
+                    "model": "gemini-3-pro",
+                    "timeout_seconds": 300,
+                },
+            },
+        }
+    )
+
+
+async def test_cli_dispatch_happy_path(
+    monkeypatch: pytest.MonkeyPatch, routing_with_gemini: RoutingConfig
+) -> None:
+    """Stage routed to gemini_cli → LLMClient calls
+    ``gemini_cli_completion`` and returns its content + model.
+    """
+    from clawfeed_intel.llm import gemini_cli as gem_module
+    from clawfeed_intel.llm.gemini_cli import GeminiCliResult
+
+    captured: dict[str, Any] = {}
+
+    async def fake_completion(config, *, messages, model):
+        captured["config"] = config
+        captured["messages"] = messages
+        captured["model"] = model
+        return GeminiCliResult(
+            content="# Compose output",
+            model=model,
+            latency_ms=1234,
+            prompt_tokens=111,
+            completion_tokens=222,
+            attempts=1,
+        )
+
+    monkeypatch.setattr(gem_module, "gemini_cli_completion", fake_completion)
+    monkeypatch.setattr("clawfeed_intel.llm.client.gemini_cli_completion", fake_completion)
+
+    client = LLMClient(routing_with_gemini)
+    result = await client.chat_completion(
+        "final_compose",
+        messages=[{"role": "user", "content": "compose this"}],
+    )
+
+    assert result.content == "# Compose output"
+    assert result.model == "gemini-3-pro"
+    assert result.prompt_tokens == 111
+    assert result.completion_tokens == 222
+    assert captured["model"] == "gemini-3-pro"
+    assert captured["config"].script_path == "/fake/gemini"
+
+
+async def test_cli_dispatch_writes_audit_row_with_gemini_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    conn: sqlite3.Connection,
+    routing_with_gemini: RoutingConfig,
+) -> None:
+    """Audit row stamps ``provider='gemini_cli'`` so the dashboard can
+    distinguish frontier calls from local-model calls.
+    """
+    from clawfeed_intel.llm.gemini_cli import GeminiCliResult
+
+    async def fake_completion(config, *, messages, model):
+        return GeminiCliResult(
+            content="ok", model=model, latency_ms=10, prompt_tokens=1, completion_tokens=1
+        )
+
+    monkeypatch.setattr("clawfeed_intel.llm.client.gemini_cli_completion", fake_completion)
+
+    run_id = _create_run(conn)
+    client = LLMClient(routing_with_gemini, conn=conn, run_id=run_id)
+    await client.chat_completion("final_compose", messages=[{"role": "user", "content": "x"}])
+
+    rows = _list_calls(conn)
+    assert len(rows) == 1
+    assert rows[0]["provider"] == "gemini_cli"
+    assert rows[0]["model"] == "gemini-3-pro"
+    assert rows[0]["status"] == "succeeded"
+
+
+async def test_cli_dispatch_with_response_schema_raises(
+    routing_with_gemini: RoutingConfig,
+) -> None:
+    """Asking for schema validation on a CLI stage is a programmer error.
+
+    The CLI emits free-form text; pretending to do JSON-schema repair
+    would hide the actual contract from the caller.
+    """
+    from pydantic import BaseModel
+
+    class StubSchema(BaseModel):
+        x: int
+
+    client = LLMClient(routing_with_gemini)
+    with pytest.raises(ValueError, match="does not support response_schema"):
+        await client.chat_completion(
+            "final_compose",
+            messages=[{"role": "user", "content": "x"}],
+            response_schema=StubSchema,
+        )
+
+
+async def test_cli_dispatch_failure_records_audit_row(
+    monkeypatch: pytest.MonkeyPatch,
+    conn: sqlite3.Connection,
+    routing_with_gemini: RoutingConfig,
+) -> None:
+    """When the CLI provider fails, the audit row records failure +
+    error string so post-hoc inspection can find what broke.
+    """
+    from clawfeed_intel.llm.gemini_cli import GeminiCliExitError
+
+    async def fake_completion(config, *, messages, model):
+        raise GeminiCliExitError(1, "oauth refresh failed")
+
+    monkeypatch.setattr("clawfeed_intel.llm.client.gemini_cli_completion", fake_completion)
+
+    run_id = _create_run(conn)
+    client = LLMClient(routing_with_gemini, conn=conn, run_id=run_id)
+    with pytest.raises(GeminiCliExitError):
+        await client.chat_completion("final_compose", messages=[{"role": "user", "content": "x"}])
+
+    rows = _list_calls(conn)
+    assert len(rows) == 1
+    assert rows[0]["provider"] == "gemini_cli"
+    assert rows[0]["status"] == "failed"
+    assert "oauth refresh failed" in rows[0]["error"]
+
+
+async def test_cli_dispatch_raises_when_provider_config_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stage that routes to gemini_cli but the providers block doesn't
+    declare it → deploy-time bug, raised loudly at first call.
+    """
+    routing = RoutingConfig.model_validate(
+        {
+            "providers": {"vmlx": {"base_url": "http://x/v1"}},
+            "stages": {
+                "final_compose": {
+                    "provider": "gemini_cli",
+                    "model": "gemini-3-pro",
+                    "timeout_seconds": 300,
+                },
+            },
+        }
+    )
+    client = LLMClient(routing)
+    with pytest.raises(ValueError, match="providers.gemini_cli is not declared"):
+        await client.chat_completion("final_compose", messages=[{"role": "user", "content": "x"}])
+
+
+async def test_stage_config_override_dispatches_against_override(
+    monkeypatch: pytest.MonkeyPatch, routing: RoutingConfig
+) -> None:
+    """``stage_config_override`` is what compose_brief's Tier-2 fallback uses.
+
+    Routing has source_planning → vmlx. We dispatch against
+    ``source_planning`` but pass an override pointing at a different
+    vmlx model; the HTTP request body must carry the override's
+    model, not the routed model.
+    """
+    from clawfeed_intel.llm import StageConfig
+
+    body_models: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        body_models.append(body["model"])
+        return httpx.Response(200, json=_ok_response(content="ok", model=body["model"]))
+
+    client = LLMClient(routing, transport=httpx.MockTransport(handler))
+    override = StageConfig(provider="vmlx", model="override-model", timeout_seconds=30)
+    result = await client.chat_completion(
+        "source_planning",
+        messages=[{"role": "user", "content": "x"}],
+        stage_config_override=override,
+    )
+
+    assert body_models == ["override-model"]
+    assert result.model == "override-model"

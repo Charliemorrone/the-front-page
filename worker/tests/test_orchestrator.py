@@ -35,6 +35,43 @@ def _empty_fetcher_registry(monkeypatch):
     monkeypatch.setattr("clawfeed_intel.fetchers.runner.FETCHER_REGISTRY", {})
 
 
+def _stub_routing_factory():
+    """Build a vmlx-only :class:`RoutingConfig` for orchestrator unit tests.
+
+    The shipped default ``config/model-routing.yaml`` routes
+    ``final_compose`` to ``gemini_cli`` (the Step 12b production
+    setting). Orchestrator unit tests must NOT shell out to a real
+    Gemini CLI; this factory builds a vmlx-only routing in memory so
+    every stage goes through ``httpx.MockTransport`` instead. No YAML
+    file is written — the function returns a fully-constructed
+    :class:`RoutingConfig` ready to substitute for ``load_routing()``.
+    """
+    from clawfeed_intel.llm import (
+        ProvidersConfig,
+        RoutingConfig,
+        StageConfig,
+        VmlxProviderConfig,
+    )
+
+    return RoutingConfig(
+        providers=ProvidersConfig(
+            vmlx=VmlxProviderConfig(base_url="http://stub-vmlx/v1"),
+        ),
+        stages={
+            "source_planning": StageConfig(
+                provider="vmlx", model="stub-source-planning", timeout_seconds=30
+            ),
+            "relevance_filter": StageConfig(
+                provider="vmlx", model="stub-filter", timeout_seconds=30, batch_size=12
+            ),
+            "cluster_summary": StageConfig(
+                provider="vmlx", model="stub-summary", timeout_seconds=30
+            ),
+            "final_compose": StageConfig(provider="vmlx", model="stub-compose", timeout_seconds=30),
+        },
+    )
+
+
 def _stub_llm_client(monkeypatch, *, keep_all: bool = True) -> None:
     """Replace ``orchestrator._build_llm_client`` with a deterministic stub.
 
@@ -116,6 +153,12 @@ def _stub_llm_client(monkeypatch, *, keep_all: bool = True) -> None:
         )
 
     monkeypatch.setattr("clawfeed_intel.pipeline.orchestrator._build_llm_client", _build)
+    # Override load_routing too so the orchestrator never reads the
+    # shipped YAML (which routes final_compose to the real Gemini CLI).
+    monkeypatch.setattr(
+        "clawfeed_intel.pipeline.orchestrator.load_routing",
+        lambda: _stub_routing_factory(),
+    )
 
 
 def test_run_daily_publishes_digest_and_links_run(temp_db, monkeypatch, tmp_path):

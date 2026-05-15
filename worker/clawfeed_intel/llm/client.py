@@ -48,7 +48,12 @@ from tenacity import (
 )
 
 from .. import db
-from .routing import RoutingConfig, StageConfig
+from .gemini_cli import (
+    GeminiCliProviderConfig as GeminiCliRuntimeConfig,
+    GeminiCliResult,
+    gemini_cli_completion,
+)
+from .routing import GeminiCliProviderConfig, RoutingConfig, StageConfig
 
 log = logging.getLogger(__name__)
 
@@ -162,6 +167,17 @@ class LLMClient:
         self._run_id = run_id
         self._retry_config = retry_config or _DEFAULT_RETRY
 
+    @property
+    def routing(self) -> RoutingConfig:
+        """Public read-only access to the routing config.
+
+        Callers like :func:`~clawfeed_intel.pipeline.compose.compose_brief`
+        need to inspect ``StageConfig.fallback`` to drive the multi-tier
+        resilience chain. Exposing the routing object publicly is cleaner
+        than reaching at ``_routing`` from outside the package.
+        """
+        return self._routing
+
     async def chat_completion(
         self,
         stage: str,
@@ -171,6 +187,7 @@ class LLMClient:
         prompt_version: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        stage_config_override: StageConfig | None = None,
     ) -> CallResult:
         """Dispatch one chat-completion against the configured stage.
 
@@ -178,28 +195,86 @@ class LLMClient:
         when omitted the provider's default sampling temperature is used
         (vMLX defaults to ~0.7 for Qwen-style models). Structured-output
         stages typically want ``0.0``–``0.1`` to keep JSON well-formed
-        under load.
+        under load. The ``gemini_cli`` provider ignores ``temperature``
+        and ``max_tokens`` — sampling is configured server-side by
+        Gemini and the CLI doesn't surface either knob.
 
-        ``max_tokens`` is similarly forwarded when supplied. Local MLX
-        servers default to ~1024 completion tokens which is too small
-        for batched structured outputs (e.g. a 12-cluster relevance
-        batch returns ~12-15 tokens × verdict-shape ≈ over 1024). Pin
-        a higher value at the call site when emitting JSON arrays.
+        ``max_tokens`` is forwarded only on the HTTP path; see above.
+
+        ``stage_config_override`` lets a caller (currently the compose
+        stage's Tier-2 fallback path) dispatch against a synthesized
+        stage config without registering it in the YAML. The audit row
+        still records the caller-supplied ``stage`` string for grouping;
+        ``provider`` and ``model`` columns reflect the override so the
+        log distinguishes the fallback call from the primary.
 
         Raises:
             KeyError: stage not in the routing config.
-            httpx.HTTPStatusError: provider returned a non-transient 4xx,
-                or 5xx/429 after exhausting retries.
-            httpx.HTTPError: transport-level failure after exhausting
+            httpx.HTTPStatusError: HTTP provider returned a non-transient
+                4xx, or 5xx/429 after exhausting retries.
+            httpx.HTTPError: HTTP transport-level failure after exhausting
                 retries.
-            LLMSchemaError: response (and the repair retry) failed JSON
-                parse or schema validation.
-            ValueError: response payload missing required fields.
+            GeminiCliError: CLI provider failed after its internal retry.
+            LLMSchemaError: HTTP response (and the repair retry) failed
+                JSON parse or schema validation. CLI provider does not
+                support schema validation.
+            ValueError: response payload missing required fields, or
+                ``response_schema`` supplied with a CLI provider stage.
         """
-        stage_config = self._routing.resolve(stage)
+        stage_config = stage_config_override or self._routing.resolve(stage)
         metrics = _Metrics()
         input_hash = _hash_messages(messages)
         wall_start = time.perf_counter()
+
+        # Branch on provider type. The CLI path has its own retry +
+        # timeout machinery inside :func:`gemini_cli_completion`, so we
+        # don't wrap it in tenacity here; doing so would double-count
+        # attempts and mask provider-level diagnostics.
+        if stage_config.provider == "gemini_cli":
+            if response_schema is not None:
+                raise ValueError(
+                    "gemini_cli provider does not support response_schema; "
+                    "the CLI emits free-form text, not structured JSON"
+                )
+            try:
+                result = await self._cli_call(stage_config, messages, metrics)
+            except BaseException as exc:
+                wall_ms = int((time.perf_counter() - wall_start) * 1000)
+                self._record(
+                    stage=stage,
+                    stage_config=stage_config,
+                    input_hash=input_hash,
+                    output_hash=None,
+                    latency_ms=wall_ms,
+                    metrics=metrics,
+                    status="failed",
+                    error=_short_error(exc),
+                    prompt_version=prompt_version,
+                )
+                raise
+            wall_ms = int((time.perf_counter() - wall_start) * 1000)
+            self._record(
+                stage=stage,
+                stage_config=stage_config,
+                input_hash=input_hash,
+                output_hash=_hash_content(result.content),
+                latency_ms=wall_ms,
+                metrics=metrics,
+                status="succeeded",
+                error=None,
+                prompt_version=prompt_version,
+            )
+            # Replace the provider's wall-clock with our own (which
+            # includes the audit overhead) so latency_ms stays
+            # consistent with the HTTP path.
+            return CallResult(
+                content=result.content,
+                model=result.model,
+                latency_ms=wall_ms,
+                prompt_tokens=result.prompt_tokens,
+                completion_tokens=result.completion_tokens,
+                parsed=None,
+            )
 
         try:
             content, model = await self._call_with_retries(
@@ -363,11 +438,54 @@ class LLMClient:
             return response.json()
 
     def _build_url(self, stage_config: StageConfig) -> str:
-        # Step 11 will branch on ``stage_config.provider`` here to pick
-        # between vmlx (HTTP) and openclaw (WebSocket gateway).
+        # Step 12b: HTTP path is vmlx only. The gemini_cli provider is
+        # dispatched through ``_cli_call`` (subprocess, not HTTP) and
+        # never reaches this method.
         del stage_config
         provider = self._routing.providers.vmlx
         return f"{provider.base_url.rstrip('/')}/chat/completions"
+
+    async def _cli_call(
+        self,
+        stage_config: StageConfig,
+        messages: list[dict[str, str]],
+        metrics: _Metrics,
+    ) -> GeminiCliResult:
+        """Dispatch one ``gemini_cli`` completion.
+
+        The provider's config (``executable_path``, timeouts, etc.) is
+        read off ``self._routing.providers.gemini_cli`` — the pydantic
+        YAML shape. ``StageConfig.retries`` / ``retry_backoff_seconds``
+        are read off the stage and override the provider defaults when
+        present, so per-stage retry policy is YAML-tunable.
+
+        Raises:
+            ValueError: ``gemini_cli`` not declared in the providers
+                block (deploy bug — a stage routed to it but the
+                provider config is missing).
+            GeminiCliError: subprocess failed after its retries.
+        """
+        provider_yaml = self._routing.providers.gemini_cli
+        if provider_yaml is None:
+            raise ValueError(
+                "stage routes to gemini_cli provider but providers.gemini_cli "
+                "is not declared in model-routing.yaml"
+            )
+        # Convert the pydantic YAML shape to the dataclass the async
+        # function consumes. Stage-level overrides (retries,
+        # retry_backoff_seconds) win when supplied.
+        runtime = _build_gemini_runtime_config(provider_yaml, stage_config)
+        result = await gemini_cli_completion(
+            runtime,
+            messages=messages,
+            model=stage_config.model,
+        )
+        # Fold token usage into the same accumulator the HTTP path uses
+        # so :func:`db.record_llm_call` sees a non-zero count when the
+        # Gemini stream emits a usage event.
+        metrics.prompt_tokens += result.prompt_tokens
+        metrics.completion_tokens += result.completion_tokens
+        return result
 
     def _record(
         self,
@@ -499,6 +617,39 @@ def _hash_messages(messages: list[dict[str, str]]) -> str:
 def _hash_content(content: str) -> str:
     """SHA-256 over the response content string."""
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _build_gemini_runtime_config(
+    provider_yaml: GeminiCliProviderConfig,
+    stage_config: StageConfig,
+) -> GeminiCliRuntimeConfig:
+    """Convert the pydantic provider config into the dataclass runtime shape.
+
+    Stage-level ``retries`` / ``retry_backoff_seconds`` override the
+    provider defaults when present — lets a YAML deployment tune the
+    compose stage's retry policy without changing other stages or
+    providers. ``hard_timeout_seconds`` is taken from the provider
+    config so it applies uniformly to every stage routed at gemini_cli;
+    ``StageConfig.timeout_seconds`` mirrors it as documentation but is
+    not separately consulted (a per-stage CLI timeout that differs
+    from the provider-wide CLI timeout would be a confusing config).
+    """
+    retries = stage_config.retries if stage_config.retries is not None else provider_yaml.retries
+    backoff = (
+        stage_config.retry_backoff_seconds
+        if stage_config.retry_backoff_seconds is not None
+        else provider_yaml.retry_backoff_seconds
+    )
+    return GeminiCliRuntimeConfig(
+        script_path=provider_yaml.script_path,
+        executable_path=provider_yaml.executable_path,
+        approval_mode=provider_yaml.approval_mode,
+        output_format=provider_yaml.output_format,
+        idle_timeout_seconds=provider_yaml.idle_timeout_seconds,
+        hard_timeout_seconds=provider_yaml.hard_timeout_seconds,
+        retries=retries,
+        retry_backoff_seconds=backoff,
+    )
 
 
 def _short_error(exc: BaseException) -> str:

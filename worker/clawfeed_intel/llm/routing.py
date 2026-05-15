@@ -38,29 +38,87 @@ class VmlxProviderConfig(_ConfigBase):
     api_key_env: str | None = None
 
 
+class GeminiCliProviderConfig(_ConfigBase):
+    """Gemini CLI subprocess provider config (Step 12b).
+
+    The provider invokes the Gemini CLI as a child process and reads
+    stream-json events from its stdout. ``executable_path`` lets us
+    bypass a broken PATH-resolved shebang (the local ``node@22`` is
+    linked against an absent ``libsimdjson.30.dylib``); when omitted,
+    we invoke ``script_path`` directly and rely on its shebang.
+
+    Defaults mirror the dataclass in ``llm/gemini_cli.py``; both shapes
+    coexist because the dataclass is the runtime contract of the async
+    function and the pydantic model is the YAML-validation contract.
+    Field names and defaults must stay in sync; a single ``from_yaml_*``
+    converter lives on this class.
+    """
+
+    script_path: str = Field(min_length=1)
+    executable_path: str | None = None
+    approval_mode: str = "plan"
+    output_format: str = "stream-json"
+    idle_timeout_seconds: float = Field(default=60.0, gt=0)
+    hard_timeout_seconds: float = Field(default=300.0, gt=0)
+    retries: int = Field(default=1, ge=0)
+    retry_backoff_seconds: float = Field(default=10.0, ge=0)
+
+
 class ProvidersConfig(_ConfigBase):
     """Provider registry.
 
-    Phase 1 ships with vmlx only. Step 11 adds an ``openclaw`` field here
-    (WebSocket gateway transport, gpt-5.3-codex) for final composition.
+    Phase 1 shipped with vmlx only. Step 12b adds ``gemini_cli`` for
+    the final-composition stage. Both are optional in the YAML so a
+    deployment can ship either one alone; declaring a stage that
+    references a missing provider fails at ``resolve`` time, not at
+    YAML load.
     """
 
     vmlx: VmlxProviderConfig
+    gemini_cli: GeminiCliProviderConfig | None = None
+
+
+class FallbackConfig(_ConfigBase):
+    """Secondary stage routing used when the primary provider fails.
+
+    Compose-stage policy: Tier 1 = primary (``gemini_cli`` per the
+    2026-05-15 amendment), Tier 2 = this fallback (local vMLX with
+    the strongest cached model), Tier 3 = deterministic
+    ``render_fallback_brief``. Tier 3 lives in the compose pure
+    layer; Tier 2 is whatever this fallback config points at.
+
+    Only ``provider`` + ``model`` are required. ``timeout_seconds``
+    inherits the parent stage's value when omitted — the fallback is
+    a different model, not a different patience budget.
+    """
+
+    provider: Literal["vmlx", "gemini_cli"]
+    model: str = Field(min_length=1)
+    timeout_seconds: float | None = Field(default=None, gt=0)
 
 
 class StageConfig(_ConfigBase):
     """One stage's dispatch rules.
 
     ``batch_size`` is consumed by the relevance filter (step 9, default 12
-    per the architecture doc). Parsed here so adding the relevance filter
-    doesn't need a schema bump.
+    per the architecture doc). ``fallback`` is consumed by the compose
+    stage (step 12b) to wire up the three-tier resilience chain; other
+    stages may declare it but no current caller reads it for them.
+
+    ``retries`` and ``retry_backoff_seconds`` are read by the
+    ``gemini_cli`` provider only (the HTTP path uses its own
+    tenacity-driven retry config on the client). The fields are
+    optional + ignored for non-CLI providers so the YAML stays
+    declarative.
     """
 
-    # Widens to ``Literal["vmlx", "openclaw"]`` in step 11.
-    provider: Literal["vmlx"]
+    provider: Literal["vmlx", "gemini_cli"]
     model: str = Field(min_length=1)
     timeout_seconds: float = Field(gt=0)
     batch_size: int | None = Field(default=None, gt=0)
+    retries: int | None = Field(default=None, ge=0)
+    retry_backoff_seconds: float | None = Field(default=None, ge=0)
+    fallback: FallbackConfig | None = None
 
 
 class RoutingConfig(_ConfigBase):

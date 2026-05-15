@@ -47,7 +47,8 @@ import sqlite3
 from dataclasses import dataclass
 
 from .. import db
-from ..llm import LLMClient
+from ..llm import LLMClient, StageConfig
+from ..llm.routing import FallbackConfig
 from ..runs import Coverage
 from ..sources import CategoryPlan, SourcePlan
 
@@ -528,12 +529,26 @@ class ComposeResult:
     """Outcome of one compose run, surfaced to the orchestrator.
 
     ``provider_tag`` is what gets stamped onto
-    ``metadata.composition_provider``: ``"vmlx_fallback"`` on the
-    happy path (architecture-doc label for "frontier wasn't used"),
-    ``"local_stub_empty"`` when zero items reached the composer, or
-    ``"local_stub_failed"`` when the LLM call or normalization failed
-    and the deterministic fallback brief was substituted. Distinct
-    tags so the dashboard can later report what produced the brief.
+    ``metadata.composition_provider``:
+
+    - ``"gemini_cli"`` — Tier 1 frontier compose succeeded
+      (architecture-doc target after the 2026-05-15 amendment).
+    - ``"vmlx_fallback"`` — Either Tier 1 routed to vMLX directly
+      (no gemini_cli configured in the YAML), or Tier 2 fell back
+      to vMLX after a Tier 1 (gemini_cli) failure. The label is
+      shared because the operator-facing meaning is the same: a
+      local model produced the brief.
+    - ``"local_stub_failed"`` — Tier 3 deterministic
+      ``render_fallback_brief`` ran because both Tier 1 and Tier 2
+      (when configured) failed.
+    - ``"local_stub_empty"`` — Zero summarized clusters reached
+      compose; deterministic empty-brief stub was emitted, no LLM
+      call. (Unchanged from Phase 1.)
+
+    Persistent ``"vmlx_fallback"`` days after Step 12b indicates the
+    Gemini CLI Tier 1 is failing repeatedly — a signal worth
+    investigating from the dashboard rather than letting it drift
+    into a quiet-degraded daily routine.
     """
 
     markdown: str
@@ -555,23 +570,25 @@ async def compose_brief(
 ) -> ComposeResult:
     """Produce one Markdown daily brief for *run_id*.
 
-    Flow:
+    Three-tier resilience chain (Step 12b):
 
-    1. Load summarized items via :func:`db.iter_summarized_clusters_with_summary`
-       and hydrate :class:`ComposeItem` instances (deserializing the
-       JSON-list TEXT columns).
-    2. If no items: return :func:`render_empty_brief` directly. Skipping
-       the LLM call saves tokens and avoids the "compose against an
-       empty prompt" anti-pattern.
-    3. Otherwise: dispatch one :meth:`LLMClient.chat_completion` call
-       against the ``final_compose`` stage with
-       ``temperature=0.3``, ``max_tokens=8192``, no JSON schema.
-    4. Normalize the response via :func:`normalize_compose_output`
-       (fence + preamble stripping).
-    5. On LLM failure OR normalization failure: log + render the
-       deterministic :func:`render_fallback_brief`. The run still
-       publishes — architecture-doc rule "always publish a useful
-       brief" extended to the compose stage.
+    1. **Empty short-circuit.** Zero items → :func:`render_empty_brief`
+       directly, no LLM call. Tag: ``"local_stub_empty"``.
+    2. **Tier 1** — primary stage (``final_compose``). With the
+       2026-05-15 amendment this routes through ``gemini_cli`` to
+       Gemini 3 Pro, but a vmlx-only deployment is still supported.
+       On success: tag ``"gemini_cli"`` or ``"vmlx_fallback"``
+       depending on the routed provider.
+    3. **Tier 2** — fallback stage if the primary failed AND a
+       ``fallback`` block is declared on the ``final_compose`` stage
+       in ``model-routing.yaml``. The architecture doc routes this
+       to the strongest cached local vMLX model. On success: tag
+       ``"vmlx_fallback"``. Skipped entirely when no fallback is
+       declared (Tier 1 failure goes straight to Tier 3).
+    4. **Tier 3** — deterministic :func:`render_fallback_brief`
+       built directly from the cluster summaries. No LLM call.
+       Tag: ``"local_stub_failed"``. The architecture-doc rule
+       "always publish a useful brief" lives here.
 
     Returns a :class:`ComposeResult` carrying the Markdown plus the
     provider tag the orchestrator stamps onto metadata.
@@ -588,33 +605,121 @@ async def compose_brief(
         )
         return ComposeResult(markdown=markdown, provider_tag="local_stub_empty", model=model)
 
+    plan_categories = list(plan.categories)
+    primary_stage = llm_client.routing.resolve("final_compose")
+    # Capture the primary failure outside the except block so the
+    # else-branch below can build the Tier-3 failure_reason from it.
+    # Python clears exception variables at except-scope exit.
+    primary_failure: BaseException | None = None
+
+    # Tier 1: primary stage.
     try:
         markdown = await _compose_via_llm(
             llm_client,
             items=items,
-            plan_categories=list(plan.categories),
+            plan_categories=plan_categories,
             coverage=coverage,
             window_start=window_start,
             window_end=window_end,
             prompt_version=prompt_version,
+            stage_config_override=None,
         )
-        return ComposeResult(markdown=markdown, provider_tag="vmlx_fallback", model=model)
-    except Exception as exc:
+        tier1_tag = _provider_tag_for(primary_stage)
+        return ComposeResult(
+            markdown=markdown,
+            provider_tag=tier1_tag,
+            model=primary_stage.model,
+        )
+    except Exception as primary_exc:
+        primary_failure = primary_exc
         log.warning(
-            "run %d: final-compose call failed (%s); falling back to local stub",
+            "run %d: Tier 1 final-compose (%s) failed (%s); trying fallback",
             run_id,
-            exc,
+            primary_stage.provider,
+            primary_exc,
         )
-        markdown = render_fallback_brief(
-            items,
-            plan_categories=list(plan.categories),
-            coverage=coverage,
-            window_start=window_start,
-            window_end=window_end,
-            run_id=run_id,
-            failure_reason=_short_failure(exc),
-        )
-        return ComposeResult(markdown=markdown, provider_tag="local_stub_failed", model=model)
+
+    # Tier 2: fallback stage if configured.
+    if primary_stage.fallback is not None:
+        fallback_stage = _stage_from_fallback(primary_stage.fallback, primary_stage)
+        try:
+            markdown = await _compose_via_llm(
+                llm_client,
+                items=items,
+                plan_categories=plan_categories,
+                coverage=coverage,
+                window_start=window_start,
+                window_end=window_end,
+                prompt_version=prompt_version,
+                stage_config_override=fallback_stage,
+            )
+            return ComposeResult(
+                markdown=markdown,
+                provider_tag="vmlx_fallback",
+                model=fallback_stage.model,
+            )
+        except Exception as fallback_exc:
+            log.warning(
+                "run %d: Tier 2 fallback compose (%s) also failed (%s); rendering deterministic brief",
+                run_id,
+                fallback_stage.provider,
+                fallback_exc,
+            )
+            failure_reason = _short_failure(fallback_exc)
+    else:
+        assert primary_failure is not None
+        failure_reason = _short_failure(primary_failure)
+
+    # Tier 3: deterministic fallback brief.
+    markdown = render_fallback_brief(
+        items,
+        plan_categories=plan_categories,
+        coverage=coverage,
+        window_start=window_start,
+        window_end=window_end,
+        run_id=run_id,
+        failure_reason=failure_reason,
+    )
+    return ComposeResult(
+        markdown=markdown,
+        provider_tag="local_stub_failed",
+        model=model,
+    )
+
+
+def _provider_tag_for(stage_config: StageConfig) -> str:
+    """Map a stage's provider to the metadata tag the dashboard reads.
+
+    ``gemini_cli`` → ``"gemini_cli"`` (frontier compose ran).
+    ``vmlx`` → ``"vmlx_fallback"`` (local model ran; either by config
+    choice or because frontier was unconfigured in this deployment).
+    The shared ``"vmlx_fallback"`` tag for both "vmlx as primary" and
+    "vmlx as Tier 2 fallback" is intentional: operationally an
+    operator reading the dashboard cares whether frontier was used,
+    not which tier produced a non-frontier result.
+    """
+    if stage_config.provider == "gemini_cli":
+        return "gemini_cli"
+    return "vmlx_fallback"
+
+
+def _stage_from_fallback(
+    fallback: FallbackConfig,
+    parent: StageConfig,
+) -> StageConfig:
+    """Build a synthetic ``StageConfig`` from a parent's fallback block.
+
+    ``timeout_seconds`` falls through to the parent's value when the
+    fallback doesn't override it. Other parent-only fields
+    (``batch_size``, ``retries``, the recursive ``fallback``) are
+    deliberately dropped — Tier 2 doesn't recurse, doesn't batch, and
+    uses the provider's default retry policy.
+    """
+    return StageConfig(
+        provider=fallback.provider,
+        model=fallback.model,
+        timeout_seconds=fallback.timeout_seconds or parent.timeout_seconds,
+    )
 
 
 async def _compose_via_llm(
@@ -626,11 +731,15 @@ async def _compose_via_llm(
     window_start: str,
     window_end: str,
     prompt_version: str,
+    stage_config_override: StageConfig | None,
 ) -> str:
     """Run one compose call and normalize the response.
 
-    Raises on any LLM or normalization failure — the caller routes
-    those to the deterministic fallback brief.
+    ``stage_config_override`` is forwarded into
+    :meth:`LLMClient.chat_completion` so a Tier 2 call dispatches
+    against the fallback provider/model without needing a separate
+    YAML stage entry. Raises on any LLM or normalization failure —
+    the caller decides whether to try the next tier.
     """
     messages = build_compose_messages(
         items,
@@ -645,6 +754,7 @@ async def _compose_via_llm(
         prompt_version=prompt_version,
         temperature=_COMPOSE_TEMPERATURE,
         max_tokens=_COMPOSE_MAX_TOKENS,
+        stage_config_override=stage_config_override,
     )
     return normalize_compose_output(result.content)
 
