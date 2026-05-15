@@ -3,10 +3,14 @@
 Phase 1 surface:
     clawfeed-intel doctor             health-check vMLX, OpenClaw, DB
     clawfeed-intel run daily          run a daily brief (24h window)
+    clawfeed-intel cleanup            prune old raw_items + llm_calls
 
 `doctor` is the canonical "is the system runnable" probe. It exits non-zero
 if any check fails so a cron job can short-circuit cleanly before kicking
-off a daily run.
+off a daily run. `cleanup` is the retention complement — keeps the DB
+from growing unbounded over indefinite daily operation per the
+architecture-doc retention policy (raw items: 30-90 days; llm calls:
+30 days).
 """
 
 from __future__ import annotations
@@ -155,6 +159,40 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_cleanup(args: argparse.Namespace) -> int:
+    """Prune old ``raw_items`` and ``llm_calls`` per the retention policy.
+
+    Default mode is dry-run: print counts of what would be removed, then
+    exit 0 without touching the DB. ``--apply`` is the explicit opt-in to
+    the destructive operation. This shape suits both interactive use
+    ("show me what's stale") and cron use (call with ``--apply`` once a
+    week). Exit code is 0 on success; non-zero only on unexpected errors
+    (DB unreachable, etc.) so cron can read ``$?`` as a "did cleanup
+    finish cleanly" signal.
+
+    The two retention windows are independently tunable so an operator
+    can keep more raw_items than llm_calls (the architecture-doc default).
+    """
+    raw_keep = args.raw_items_keep_days
+    llm_keep = args.llm_calls_keep_days
+    raw_cutoff = db.cutoff_iso(keep_days=raw_keep)
+    llm_cutoff = db.cutoff_iso(keep_days=llm_keep)
+
+    with closing(db.connect()) as conn:
+        raw_count = db.count_raw_items_before(conn, raw_cutoff)
+        llm_count = db.count_llm_calls_before(conn, llm_cutoff)
+        if args.apply:
+            raw_removed = db.prune_raw_items_before(conn, raw_cutoff)
+            llm_removed = db.prune_llm_calls_before(conn, llm_cutoff)
+            print(f"removed {raw_removed} raw_items older than {raw_cutoff}")
+            print(f"removed {llm_removed} llm_calls older than {llm_cutoff}")
+        else:
+            print(f"would remove {raw_count} raw_items older than {raw_cutoff}")
+            print(f"would remove {llm_count} llm_calls older than {llm_cutoff}")
+            print("(re-run with --apply to actually delete)")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="clawfeed-intel")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -171,6 +209,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="time window covered by this run (default: 24h)",
     )
 
+    cleanup = sub.add_parser(
+        "cleanup",
+        help="prune old raw_items and llm_calls per retention policy",
+    )
+    cleanup.add_argument(
+        "--raw-items-keep-days",
+        type=int,
+        default=90,
+        help="delete raw_items older than N days (default: 90)",
+    )
+    cleanup.add_argument(
+        "--llm-calls-keep-days",
+        type=int,
+        default=30,
+        help="delete llm_calls older than N days (default: 30)",
+    )
+    cleanup.add_argument(
+        "--apply",
+        action="store_true",
+        help="actually delete (default: dry-run, print counts only)",
+    )
+
     return parser
 
 
@@ -183,6 +243,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_doctor(args)
     if args.cmd == "run" and args.run_type == "daily":
         return cmd_run_daily(args)
+    if args.cmd == "cleanup":
+        return cmd_cleanup(args)
 
     parser.print_help()
     return 2

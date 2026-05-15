@@ -1102,3 +1102,104 @@ def record_llm_call(
             ),
         )
         return int(cur.lastrowid or 0)
+
+
+# ── retention (Phase 6a) ──────────────────────────────────────────────────────
+
+
+def count_raw_items_before(conn: sqlite3.Connection, cutoff: str) -> int:
+    """Count ``raw_items`` rows with ``fetched_at < cutoff``.
+
+    Comparison is lexicographic on the worker's UTC ISO timestamp
+    format (``YYYY-MM-DDTHH:MM:SS+00:00``) — which is consistent across
+    every fetcher and orchestrator write, so string comparison is
+    equivalent to chronological comparison.
+
+    Read-only; used by ``clawfeed-intel cleanup`` to report what would
+    be removed before the operator opts into the actual delete.
+    """
+    cur = conn.execute(
+        "SELECT COUNT(*) FROM raw_items WHERE fetched_at < ?",
+        (cutoff,),
+    )
+    return int(cur.fetchone()[0])
+
+
+def prune_raw_items_before(conn: sqlite3.Connection, cutoff: str) -> int:
+    """Delete ``raw_items`` rows with ``fetched_at < cutoff``; return removed count.
+
+    Architecture-doc retention: raw items live 30-90 days. The cutoff
+    is the operator's call (per ``clawfeed-intel cleanup`` invocation
+    or whatever caller picks).
+
+    Foreign-key cascade handles ``run_raw_items`` and ``cluster_items``
+    entries (both declare ``ON DELETE CASCADE`` on ``raw_item_id``).
+    ``item_clusters`` and ``item_summaries`` are intentionally
+    preserved — the architecture doc rule is "Runs and summaries:
+    indefinite until manually pruned." Orphaned clusters (whose
+    members all aged out) survive carrying their headline + summary
+    text; the brief that referenced them was already published.
+
+    Uses :func:`transaction` for atomic delete + cascade — partial
+    failure mid-cascade rolls back so the DB doesn't end up with
+    dangling joining rows.
+    """
+    with transaction(conn):
+        cur = conn.execute(
+            "DELETE FROM raw_items WHERE fetched_at < ?",
+            (cutoff,),
+        )
+        return int(cur.rowcount or 0)
+
+
+def count_llm_calls_before(conn: sqlite3.Connection, cutoff: str) -> int:
+    """Count ``llm_calls`` rows with ``created_at < cutoff``.
+
+    Read-only; the dry-run counterpart of :func:`prune_llm_calls_before`.
+    """
+    cur = conn.execute(
+        "SELECT COUNT(*) FROM llm_calls WHERE created_at < ?",
+        (cutoff,),
+    )
+    return int(cur.fetchone()[0])
+
+
+def prune_llm_calls_before(conn: sqlite3.Connection, cutoff: str) -> int:
+    """Delete ``llm_calls`` rows with ``created_at < cutoff``; return removed count.
+
+    Architecture-doc retention: LLM call logs live 30 days, or are
+    compressed after 90 days. Phase 1 implements simple-delete only;
+    a compression / archival pass is deferred — the architecture
+    rationale is "audit trail rather than re-runnable artifact," so
+    losing old rows doesn't break re-runs (raw_items + summaries
+    survive their own retention windows).
+
+    ``llm_calls.run_id`` is ``ON DELETE SET NULL`` (not cascade), so
+    pruning an old run's calls doesn't touch the run row itself —
+    that survives indefinitely per the architecture-doc rule.
+    """
+    with transaction(conn):
+        cur = conn.execute(
+            "DELETE FROM llm_calls WHERE created_at < ?",
+            (cutoff,),
+        )
+        return int(cur.rowcount or 0)
+
+
+def cutoff_iso(*, now: datetime | None = None, keep_days: int) -> str:
+    """Compute the UTC ISO cutoff timestamp for a retention window.
+
+    ``keep_days`` is the number of days the caller wants to keep; rows
+    older than ``now - keep_days`` are eligible for deletion. ``now``
+    defaults to :func:`datetime.now(timezone.utc)`; tests pin it so
+    the cutoff is reproducible.
+
+    Output format matches the worker's standard ISO shape
+    (``YYYY-MM-DDTHH:MM:SS+00:00``), so it's directly comparable to
+    ``raw_items.fetched_at`` and ``llm_calls.created_at`` via SQL
+    lexicographic comparison.
+    """
+    if keep_days < 0:
+        raise ValueError(f"keep_days must be >= 0, got {keep_days}")
+    moment = now if now is not None else datetime.now(timezone.utc)
+    return (moment - timedelta(days=keep_days)).isoformat(timespec="seconds")
