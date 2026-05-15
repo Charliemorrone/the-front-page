@@ -27,10 +27,13 @@ import os
 import sys
 from contextlib import closing
 
+from pathlib import Path
+
 from . import __version__, db, doctor, launchagent
 from .llm import load_routing
 from .paths import DB_PATH, REPO_ROOT
 from .pipeline.orchestrator import run_daily
+from .sources import build_source_plan
 
 log = logging.getLogger(__name__)
 
@@ -128,6 +131,9 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
     # degrade per-batch as before; this only catches the "down from the
     # start" case. Exit 3 distinguishes preflight failure from the existing
     # 2 used for `ValueError` (bad window spec).
+    if args.dry_run:
+        return cmd_run_daily_dry_run(args)
+
     try:
         routing = load_routing()
     except Exception as exc:
@@ -161,6 +167,148 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     print(f"published digest {digest_id}")
+    return 0
+
+
+def cmd_run_daily_dry_run(args: argparse.Namespace) -> int:
+    """Validate the daily-run pipeline without invoking LLM stages or fetchers.
+
+    Each section reports ``[ ok ]`` / ``[FAIL]`` / ``[info]`` / ``[warn]``
+    and a short detail line. Exit 0 if every critical check passes;
+    exit 3 on the first failure that would prevent the live run from
+    succeeding.
+
+    The dry-run is the canonical "would the next 06:15 launchd fire
+    actually produce a brief?" check. It runs every preflight the live
+    ``run daily`` would run, plus inspection of pieces the live run
+    doesn't validate up-front (source plan resolution, log dir
+    writability, launchd registration state, Gemini CLI binary
+    reachability). Useful right after ``cron install --install`` to
+    catch configuration drift before the operator forgets the change.
+
+    Critical (returns 3 on failure): routing parses; vMLX probes pass;
+    ``gemini_cli`` provider's executable + script files exist when the
+    provider is configured; source plan resolves without raising; log
+    dir is creatable.
+
+    Informational (never fails the check): launchd installation status;
+    source plan warnings; absence of a configured ``gemini_cli``
+    provider (means Tier-1 routes through vMLX, which is a valid but
+    unusual deployment after the 2026-05-15 amendment).
+    """
+    print("=== clawfeed-intel run daily --dry-run ===")
+    print(f"window: {args.window}")
+    print()
+
+    # 1. Routing config
+    print("[routing]")
+    try:
+        routing = load_routing()
+    except Exception as exc:
+        print(f"  [FAIL] config failed to load: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 3
+    print(f"  [ ok ] {len(routing.stages)} stages: {', '.join(sorted(routing.stages))}")
+    final = routing.stages.get("final_compose")
+    if final is not None:
+        fb = (
+            f" → fallback to {final.fallback.provider}/{final.fallback.model}"
+            if final.fallback
+            else " (no fallback)"
+        )
+        print(f"  [ ok ] final_compose: {final.provider}/{final.model}{fb}")
+    print()
+
+    # 2. vMLX probes
+    print("[vmlx]")
+    try:
+        probes = asyncio.run(doctor.run_doctor_probes(routing))
+    except Exception as exc:
+        print(f"  [FAIL] probes raised: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 3
+    for probe in probes:
+        marker = " ok " if probe.ok else "FAIL"
+        print(f"  [{marker}] {probe.name:24s} {probe.latency_ms:>5d}ms — {probe.detail}")
+    if any(not p.ok for p in probes):
+        print("  vMLX preflight failed — aborting", file=sys.stderr)
+        return 3
+    print()
+
+    # 3. Gemini CLI provider reachability
+    print("[gemini_cli]")
+    gem_cfg = routing.providers.gemini_cli
+    if gem_cfg is None:
+        print(
+            "  [warn] provider not declared — final_compose Tier 1 will use vMLX "
+            "(unusual after the 2026-05-15 amendment)"
+        )
+    else:
+        node_ok = gem_cfg.executable_path is None or Path(gem_cfg.executable_path).is_file()
+        script_ok = Path(gem_cfg.script_path).is_file()
+        node_marker = " ok " if node_ok else "FAIL"
+        script_marker = " ok " if script_ok else "FAIL"
+        print(f"  [{node_marker}] executable: {gem_cfg.executable_path or '<PATH-resolved>'}")
+        print(f"  [{script_marker}] script:     {gem_cfg.script_path}")
+        print(
+            f"  [info] model: {final.model if final else '?'}, "
+            f"idle {gem_cfg.idle_timeout_seconds:.0f}s, "
+            f"hard {gem_cfg.hard_timeout_seconds:.0f}s, "
+            f"retries {gem_cfg.retries}"
+        )
+        if not (node_ok and script_ok):
+            print(
+                "  gemini_cli binaries missing — Tier 1 will fail; brief will fall back to Tier 2",
+                file=sys.stderr,
+            )
+            return 3
+    print()
+
+    # 4. Source plan
+    print("[source_plan]")
+    try:
+        with closing(db.connect()) as conn:
+            plan = build_source_plan(conn)
+    except Exception as exc:
+        print(f"  [FAIL] resolver raised: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 3
+    grouped = plan.tasks_by_kind()
+    total_tasks = sum(len(v) for v in grouped.values())
+    populated_kinds = [k for k, v in grouped.items() if v]
+    print(
+        f"  [ ok ] {len(plan.categories)} categories, {total_tasks} tasks across {len(populated_kinds)} fetcher kinds"
+    )
+    for kind in populated_kinds:
+        print(f"         {kind}: {len(grouped[kind])} task(s)")
+    if plan.warnings:
+        for w in plan.warnings:
+            cat = f" ({w.category})" if w.category else ""
+            print(f"  [warn] {w.origin}{cat}: {w.message}")
+    print()
+
+    # 5. Log dir writability
+    print("[log_dir]")
+    log_paths = launchagent.log_paths()
+    try:
+        log_paths.directory.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        print(f"  [FAIL] cannot create {log_paths.directory}: {exc}", file=sys.stderr)
+        return 3
+    print(f"  [ ok ] {log_paths.directory}")
+    print(f"  [info] launchd will write to:\n         {log_paths.out}\n         {log_paths.err}")
+    print()
+
+    # 6. LaunchAgent registration (informational only — daily run works
+    # whether or not launchd is firing it; this just tells the operator
+    # what they're looking at).
+    print("[launchd]")
+    plist = launchagent.plist_path()
+    if launchagent.is_installed():
+        print(f"  [ ok ] installed at {plist}")
+    else:
+        print(f"  [info] not installed at {plist}")
+        print("         (run `clawfeed-intel cron install --install` to register)")
+    print()
+
+    print("preflight passed — `run daily` (without --dry-run) is ready to execute")
     return 0
 
 
@@ -317,6 +465,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--window",
         default="24h",
         help="time window covered by this run (default: 24h)",
+    )
+    daily.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "validate routing + vMLX + Gemini CLI + source plan + log dir + "
+            "launchd registration, then exit without invoking fetchers or LLMs "
+            "(useful before installing the cron job, after config changes, or "
+            "when debugging a 'no brief published' report)"
+        ),
     )
 
     cleanup = sub.add_parser(
