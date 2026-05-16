@@ -95,13 +95,15 @@ Ollama remains a fallback, not the main path. It may be used for embeddings via 
 
 Decision: **Frontier calls are allowed only after the local pipeline has already filtered, clustered, and summarized.**
 
-The system should never send hundreds of raw fetched items to the frontier model. Paid or subscription-backed model use is reserved for final brief composition:
+The system should never send hundreds of raw fetched items to the frontier model. Frontier use is reserved for final brief composition:
 
 - Daily brief final composition.
 - Topical search final composition.
 - Optional second-pass rewrite if the first final brief fails quality checks.
 
 Everything else should be local.
+
+**Auth and cost model (as amended 2026-05-15):** the current Gemini CLI integration uses an operator-managed Gemini Pro subscription via OAuth — *not* the pay-per-token Gemini API. There is no API key in the worker, no per-token cost accounting, and no per-call cost surface in the metadata. Quota is the Pro plan's subscription ceiling, which comfortably covers one daily-brief composition plus several topical-search compositions per day. See "Decision 4 amendment" and the "LLM Architecture → Model Routing" cost-model note for the full mechanics.
 
 ### 4. OpenClaw Integrates As Orchestrator, Not Product Database
 
@@ -130,7 +132,7 @@ ClawFeed should own:
 The two pipeline touchpoints originally assigned to OpenClaw — daily-run scheduling and frontier final composition — have both been reassigned after investigation against the actual installed OpenClaw build and the available alternatives:
 
 - **Daily-run scheduling** moves to macOS `launchd` (`~/Library/LaunchAgents/local.clawfeed.daily-brief.plist`, fired at `06:15` local). OpenClaw cron's real surface schedules `agentTurn` / `systemEvent` payloads — i.e. scheduled LLM calls — not arbitrary shell exec. The daily brief is a deterministic shell command, so `launchd` is the right macOS primitive. See "Scheduling And Deployment → Daily Schedule" below for the updated example.
-- **Frontier final composition** moves to **Gemini CLI** (`gemini-3-pro`) invoked as a subprocess. The non-negotiable is that the final document is composed by a frontier-class model; the original mechanism (OpenClaw → `gpt-5.3-codex`) is blocked on the gateway wire protocol being undocumented for non-Node clients. Gemini 3 via the Gemini CLI gives the same model-class with a stable subprocess contract, OAuth-managed auth, and generous Gemini Pro plan rate limits for once-a-day batch use. See "LLM Architecture → Model Routing" below for the updated stage config.
+- **Frontier final composition** moves to **Gemini CLI** (`gemini-3-pro`) invoked as a subprocess. The non-negotiable is that the final document is composed by a frontier-class model; the original mechanism (OpenClaw → `gpt-5.3-codex`) is blocked on the gateway wire protocol being undocumented for non-Node clients. Gemini 3 via the Gemini CLI gives the same model-class with a stable subprocess contract and the operator-managed OAuth auth that ships with the CLI. **Critically: the integration uses the operator's Gemini Pro subscription via the CLI's OAuth flow — not the pay-per-token Gemini API.** The worker holds no API key, has no per-token cost accounting, and is bounded only by the Pro plan's subscription quota (which comfortably covers a single composition call per day with substantial headroom). See "LLM Architecture → Model Routing" below for the updated stage config.
 
 This is a **pipeline-scope amendment only**. The original ClawFeed product surface (dashboard, user-facing agent features) remains free to integrate with OpenClaw as it always did. A future conversational-query phase against finished briefs may revisit OpenClaw as the agent runtime; that's a separate UI-layer decision and does not affect the daily-brief pipeline.
 
@@ -663,6 +665,8 @@ stages:
 ```
 
 If the Gemini CLI call fails after its single retry, the system falls back to the strongest local vMLX model and stamps `composition_provider: vmlx_fallback`. If that also fails, the deterministic `render_fallback_brief` path emits a structured Markdown brief built directly from the cluster summaries (no LLM call) and stamps `composition_provider: local_stub_failed`. The brief always publishes; the metadata always tells the truth about which tier produced it.
+
+**Cost / auth model for the `gemini_cli` provider:** the CLI is signed into the operator's Gemini Pro subscription via OAuth at install time (`gemini` interactive command); the CLI manages the refresh-token lifecycle internally. The worker holds no API key, never makes a `generativelanguage.googleapis.com` HTTP call directly, and is not billed per-token. The only relevant quota is the Pro plan's subscription ceiling, which comfortably covers one composition call per day with substantial headroom. This is materially different from the originally-considered OpenClaw → `gpt-5.3-codex` path (which would have routed through OpenClaw's gateway against frontier-API credits) and from a direct Gemini-API integration (which would have required key management + per-token cost tracking). The CLI-subprocess shape is the load-bearing reason this integration is operationally simple.
 
 ## Prompt Responsibilities
 
@@ -1534,9 +1538,11 @@ Calling a frontier model through a CLI subprocess (rather than directly via an H
 
 This tradeoff is accepted because:
 
-- The Pro plan's CLI-based auth removes API-key management from the worker.
+- **The Gemini CLI is signed into the operator's Gemini Pro subscription via OAuth — not the pay-per-token Gemini API.** The worker holds no API key, has no per-token cost accounting, and is bounded only by the Pro plan's subscription quota. Removing API-key management from the worker is the load-bearing operational simplification; pivoting to a direct API integration would re-introduce key rotation, billing reconciliation, and per-call cost tracking that the subscription-via-CLI shape avoids entirely.
 - The CLI's subprocess contract (stdin → stdout → exit code) is stable across CLI versions in ways the underlying gateway/API protocol may not be.
 - For one composition call per day, the additional process-management cost is a few dozen lines of provider code, and the fallback chain ensures a degraded brief still publishes even if every CLI mode fails.
+
+The cost model implication for Phase 7 (topical search): topical briefs incur a *second* compose call per topic query. Pro plan ceilings comfortably cover several queries per day; if Phase 7 reaches a usage pattern that approaches the ceiling, the right response is to surface a `quota_exceeded`-style error from the CLI and rely on the Tier-2 vMLX fallback, **not** to switch to a per-token API model.
 
 ## Build Chronology Summary
 

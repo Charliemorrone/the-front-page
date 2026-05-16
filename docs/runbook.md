@@ -132,6 +132,8 @@ The model named in `config/model-routing.yaml` for the failing stage must appear
 
 ### Gemini CLI auth expired
 
+**Context.** The `gemini_cli` provider is signed into the operator's **Gemini Pro subscription** via the CLI's OAuth flow. There is no API key. The CLI manages its own refresh-token lifecycle internally; "auth expired" means the refresh token has lapsed and an interactive re-login is required.
+
 **Symptom.** Published brief has `composition_provider: "vmlx_fallback"` despite the routing config showing `final_compose: gemini_cli`. The `llm_calls` row for the failed Tier-1 call has `error` containing `GeminiCliExitError` with stderr mentioning auth / login / token / OAuth.
 
 **Diagnosis.** Manually invoke the Gemini CLI:
@@ -143,17 +145,19 @@ echo "Reply with PONG." | /opt/homebrew/bin/node /opt/homebrew/bin/gemini -p "" 
 
 If the second command produces an auth error, the OAuth refresh has lapsed.
 
-**Recovery.** Re-authenticate the Gemini CLI interactively:
+**Recovery.** Re-authenticate the Gemini CLI interactively against the operator's Gemini Pro account:
 
 ```bash
 /opt/homebrew/bin/node /opt/homebrew/bin/gemini
 ```
 
-Follow the OAuth flow. Then re-run the dry-run preflight to confirm:
+Follow the OAuth flow in the terminal/browser. The CLI persists the refreshed token; no worker code change is needed. Then re-run the dry-run preflight to confirm:
 
 ```bash
 uv run clawfeed-intel run daily --dry-run
 ```
+
+**Do NOT switch to a pay-per-token Gemini API key as a fix.** The architecture-doc decision (Decision 4 amendment, 2026-05-15) is explicit: this integration uses the Pro subscription via the CLI, not the API. Quota-exceeded errors are handled by the Tier-2 vMLX fallback; a persistent quota issue is a "the Pro plan ceiling was wrong" signal, not a "we should adopt API billing" signal.
 
 ### Gemini CLI stalls mid-response (Tier-1 → Tier-2 fallback)
 

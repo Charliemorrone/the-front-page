@@ -7,6 +7,20 @@ through the OpenClaw WebSocket gateway. See
 ``docs/personal-intelligence-brief-architecture.md`` Decision 4
 amendment for the full rationale.
 
+**Auth and cost model (load-bearing).** The Gemini CLI is signed into
+the operator's **Gemini Pro subscription** via OAuth at install time
+(``gemini`` interactive command); the CLI manages the refresh-token
+lifecycle internally. **This is not the pay-per-token Gemini API.**
+The worker holds no API key, never makes a
+``generativelanguage.googleapis.com`` HTTP call directly, and incurs
+no per-token cost. Quota is the Pro plan's subscription ceiling
+(comfortably covers one daily-brief compose + several topical-search
+composes per day). A ``GeminiCliExitError`` mentioning quota /
+auth / login is recovered by re-authenticating the CLI interactively
+(`docs/runbook.md` "Gemini CLI auth expired"), NOT by swapping to a
+direct API integration — see the architecture-doc note for the
+explicit decision against API billing.
+
 This module is Step 12a: the provider in isolation. Step 12b wires it
 into :class:`~clawfeed_intel.llm.client.LLMClient` and
 :func:`~clawfeed_intel.pipeline.compose.compose_brief`.

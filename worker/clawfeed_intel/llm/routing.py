@@ -47,6 +47,13 @@ class GeminiCliProviderConfig(_ConfigBase):
     linked against an absent ``libsimdjson.30.dylib``); when omitted,
     we invoke ``script_path`` directly and rely on its shebang.
 
+    **No ``api_key_env`` field, by design.** The CLI is signed into
+    the operator's Gemini Pro subscription via OAuth at install time;
+    the CLI manages refresh tokens internally. The worker never sees
+    a Gemini API key — this is the subscription-via-CLI integration,
+    not the pay-per-token Gemini API. See the architecture doc's
+    Decision 4 amendment for why this is the explicit choice.
+
     Defaults mirror the dataclass in ``llm/gemini_cli.py``; both shapes
     coexist because the dataclass is the runtime contract of the async
     function and the pydantic model is the YAML-validation contract.

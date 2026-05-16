@@ -28,6 +28,13 @@
 # via PATH and picks the broken one. Environmental fix is tracked in
 # status doc; this routing-config override is the mitigation that
 # unblocks the worker today.
+#
+# AUTH MODEL — load-bearing, do not change without re-reading Decision 4:
+# the CLI is signed into the operator's Gemini Pro subscription via
+# OAuth (run `gemini` interactively to re-auth). The worker does NOT
+# hold an API key, does NOT call generativelanguage.googleapis.com,
+# and does NOT incur per-token cost. Quota is the Pro plan ceiling.
+# There is intentionally no `api_key_env` field for this provider.
 
 providers:
   vmlx:
