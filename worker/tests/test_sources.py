@@ -122,7 +122,13 @@ dynamic_search:
 
 
 def test_full_yaml_resolves_every_known_kind(tmp_path, temp_db):
-    """Every fetcher family has at least one task and provenance is yaml."""
+    """Every yaml-resolvable fetcher family has at least one task and provenance is yaml.
+
+    The Phase 7 topic-only kinds (``hn_algolia``, ``raw_cache``) are
+    produced by the topic orchestrator, not by the daily YAML
+    resolver, so their buckets are present in :meth:`tasks_by_kind`
+    but empty under a daily plan — that's correct, not a regression.
+    """
     config_path = _write_yaml(tmp_path, _FULL_YAML)
     with closing(worker_db.connect(temp_db)) as conn:
         plan = build_source_plan(conn, config_path=config_path)
@@ -133,10 +139,17 @@ def test_full_yaml_resolves_every_known_kind(tmp_path, temp_db):
     assert plan.profile.default_language == "en"
     assert plan.dynamic_search == ["raw_cache", "gdelt", "hn_algolia"]
 
+    # Topic-only kinds — present as empty buckets, produced by Phase 7
+    # topic orchestrator (not by the daily YAML resolver).
+    topic_only_kinds = {"hn_algolia", "raw_cache"}
+    yaml_resolvable_kinds = set(KNOWN_TASK_KINDS) - topic_only_kinds
+
     by_kind = plan.tasks_by_kind()
-    # Every kind we know about has a bucket; the YAML exercises all of them.
+    # Every kind we know about has a bucket; topic-only kinds are empty.
     assert set(by_kind.keys()) == set(KNOWN_TASK_KINDS)
-    for kind in KNOWN_TASK_KINDS:
+    for kind in topic_only_kinds:
+        assert by_kind[kind] == [], f"topic-only kind {kind!r} unexpectedly populated"
+    for kind in yaml_resolvable_kinds:
         assert by_kind[kind], f"kind {kind!r} has no tasks"
         assert all(t.origin == "yaml" for t in by_kind[kind])
         assert all(t.source_id is None for t in by_kind[kind])

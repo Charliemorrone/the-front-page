@@ -110,6 +110,60 @@ class WebsiteTask(_TaskBase):
     url: str = Field(min_length=1)
 
 
+# ── Phase 7 (topical search) task kinds ──────────────────────────────────────
+#
+# These kinds are produced by the topic orchestrator (Phase 7e) from a
+# :class:`SearchPlan`, not by the daily YAML resolver. They're absent from
+# ``_DB_TYPE_TO_KIND`` on purpose — they aren't dashboard-managed sources.
+
+
+class HnAlgoliaTask(_TaskBase):
+    """One HN Algolia search request (Phase 7c).
+
+    Algolia takes a single query string per request, so the topic
+    orchestrator dispatches one :class:`HnAlgoliaTask` per query
+    variant from the :class:`SearchPlan`. The fetcher emits
+    ``source_type="hn"`` (same as the daily Firebase fetcher) so the
+    same HN item discovered via either path dedupes naturally on
+    ``UNIQUE(source_type, dedup_key)``; ``metadata.discovered_via``
+    distinguishes ``"algolia"`` from ``"firebase"``.
+
+    ``window_start_epoch`` is the unix epoch (UTC seconds) below which
+    items are filtered out via Algolia's ``numericFilters`` param. The
+    topic orchestrator supplies this from the run's window; the fetcher
+    composes the actual ``created_at_i>{epoch}`` filter string.
+    """
+
+    kind: Literal["hn_algolia"]
+    query: str = Field(min_length=1)
+    tags: str = "story"  # "story" | "comment" | "(story,comment)" — Algolia syntax
+    window_start_epoch: int | None = None
+    hits_per_page: int = Field(default=50, ge=1, le=1000)
+
+
+class RawCacheTask(_TaskBase):
+    """Search the existing ``raw_items`` cache for a topic (Phase 7c).
+
+    Surfaces items that prior daily runs already collected, matched
+    against any of the ``query_variants`` via case-insensitive LIKE on
+    title + canonical_url + content. The fetcher emits each matched
+    raw_item's original ``source_type`` and ``dedup_key`` unchanged so
+    the runner's :func:`db.upsert_raw_item` no-ops the row and adds the
+    topic-run linkage via ``run_raw_items``. Same item discovered by
+    multiple variants dedupes naturally via SQL ``DISTINCT``.
+
+    ``window_start`` (ISO UTC) bounds the matched items by
+    ``published_at`` (falling back to ``fetched_at`` when null) so a
+    "Khosla Ventures last 30 days" topic doesn't surface 2-year-old
+    articles. ``limit`` caps the total result count.
+    """
+
+    kind: Literal["raw_cache"]
+    query_variants: list[str] = Field(min_length=1)
+    window_start: str | None = None
+    limit: int = Field(default=200, ge=1, le=2000)
+
+
 SourceTaskUnion = (
     RssTask
     | ArxivTask
@@ -120,6 +174,8 @@ SourceTaskUnion = (
     | GithubSearchTask
     | GithubTrendingTask
     | WebsiteTask
+    | HnAlgoliaTask
+    | RawCacheTask
 )
 SourceTask = Annotated[SourceTaskUnion, Field(discriminator="kind")]
 
@@ -136,6 +192,10 @@ KNOWN_TASK_KINDS: frozenset[str] = frozenset(
         "github_search",
         "github_trending",
         "website",
+        # Phase 7 topical-search kinds. Not in _DB_TYPE_TO_KIND —
+        # produced by the topic orchestrator, not by dashboard sources.
+        "hn_algolia",
+        "raw_cache",
     }
 )
 
