@@ -140,7 +140,7 @@ The model named in `config/model-routing.yaml` for the failing stage must appear
 
 ```bash
 /opt/homebrew/bin/node /opt/homebrew/bin/gemini --version
-echo "Reply with PONG." | /opt/homebrew/bin/node /opt/homebrew/bin/gemini -p "" --approval-mode plan -m gemini-3-pro
+echo "Reply with PONG." | /opt/homebrew/bin/node /opt/homebrew/bin/gemini -p "" --approval-mode plan -m gemini-2.5-pro
 ```
 
 If the second command produces an auth error, the OAuth refresh has lapsed.
@@ -313,7 +313,7 @@ curl -sS http://127.0.0.1:8080/health
 /opt/homebrew/bin/node /opt/homebrew/bin/gemini
 
 # Confirm a non-interactive call works
-echo "Reply with PONG." | /opt/homebrew/bin/node /opt/homebrew/bin/gemini -p "" -m gemini-3-pro --approval-mode plan
+echo "Reply with PONG." | /opt/homebrew/bin/node /opt/homebrew/bin/gemini -p "" -m gemini-2.5-pro --approval-mode plan
 ```
 
 ### Re-install the LaunchAgent

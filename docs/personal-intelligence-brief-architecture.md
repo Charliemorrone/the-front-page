@@ -132,7 +132,9 @@ ClawFeed should own:
 The two pipeline touchpoints originally assigned to OpenClaw — daily-run scheduling and frontier final composition — have both been reassigned after investigation against the actual installed OpenClaw build and the available alternatives:
 
 - **Daily-run scheduling** moves to macOS `launchd` (`~/Library/LaunchAgents/local.clawfeed.daily-brief.plist`, fired at `06:15` local). OpenClaw cron's real surface schedules `agentTurn` / `systemEvent` payloads — i.e. scheduled LLM calls — not arbitrary shell exec. The daily brief is a deterministic shell command, so `launchd` is the right macOS primitive. See "Scheduling And Deployment → Daily Schedule" below for the updated example.
-- **Frontier final composition** moves to **Gemini CLI** (`gemini-3-pro`) invoked as a subprocess. The non-negotiable is that the final document is composed by a frontier-class model; the original mechanism (OpenClaw → `gpt-5.3-codex`) is blocked on the gateway wire protocol being undocumented for non-Node clients. Gemini 3 via the Gemini CLI gives the same model-class with a stable subprocess contract and the operator-managed OAuth auth that ships with the CLI. **Critically: the integration uses the operator's Gemini Pro subscription via the CLI's OAuth flow — not the pay-per-token Gemini API.** The worker holds no API key, has no per-token cost accounting, and is bounded only by the Pro plan's subscription quota (which comfortably covers a single composition call per day with substantial headroom). See "LLM Architecture → Model Routing" below for the updated stage config.
+- **Frontier final composition** moves to **Gemini CLI** (`gemini-2.5-pro` — see Step 12c correction below) invoked as a subprocess. The non-negotiable is that the final document is composed by a frontier-class model; the original mechanism (OpenClaw → `gpt-5.3-codex`) is blocked on the gateway wire protocol being undocumented for non-Node clients. The Gemini CLI gives the same model-class with a stable subprocess contract and the operator-managed OAuth auth that ships with the CLI. **Critically: the integration uses the operator's Gemini Pro subscription via the CLI's OAuth flow — not the pay-per-token Gemini API.** The worker holds no API key, has no per-token cost accounting, and is bounded only by the Pro plan's subscription quota (which comfortably covers a single composition call per day with substantial headroom). See "LLM Architecture → Model Routing" below for the updated stage config.
+
+  *Step 12c correction (2026-05-15):* the originally-named `gemini-3-pro` returns 404 against the live Gemini CLI v0.36.0 + operator's Pro account. The CLI's currently-routed Pro-tier frontier model is `gemini-2.5-pro`; all references in this doc and in `config/model-routing.yaml` have been updated. If Google publishes a `gemini-3-pro` identifier accessible via the CLI in the future, the swap is a one-line YAML change — no code or architectural change required.
 
 This is a **pipeline-scope amendment only**. The original ClawFeed product surface (dashboard, user-facing agent features) remains free to integrate with OpenClaw as it always did. A future conversational-query phase against finished briefs may revisit OpenClaw as the agent runtime; that's a separate UI-layer decision and does not affect the daily-brief pipeline.
 
@@ -651,7 +653,7 @@ stages:
     timeout_seconds: 300
   final_compose:
     provider: gemini_cli
-    model: gemini-3-pro
+    model: gemini-2.5-pro   # was gemini-3-pro — corrected at Step 12c (2026-05-15) after live CLI v0.36.0 returned 404 on the original identifier
     timeout_seconds: 300
     retries: 1               # one retry on stall/timeout/non-zero exit
     retry_backoff_seconds: 10

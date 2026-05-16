@@ -916,7 +916,7 @@ def routing_with_gemini() -> RoutingConfig:
                 },
                 "final_compose": {
                     "provider": "gemini_cli",
-                    "model": "gemini-3-pro",
+                    "model": "gemini-2.5-pro",
                     "timeout_seconds": 300,
                 },
             },
@@ -958,10 +958,10 @@ async def test_cli_dispatch_happy_path(
     )
 
     assert result.content == "# Compose output"
-    assert result.model == "gemini-3-pro"
+    assert result.model == "gemini-2.5-pro"
     assert result.prompt_tokens == 111
     assert result.completion_tokens == 222
-    assert captured["model"] == "gemini-3-pro"
+    assert captured["model"] == "gemini-2.5-pro"
     assert captured["config"].script_path == "/fake/gemini"
 
 
@@ -989,7 +989,7 @@ async def test_cli_dispatch_writes_audit_row_with_gemini_provider(
     rows = _list_calls(conn)
     assert len(rows) == 1
     assert rows[0]["provider"] == "gemini_cli"
-    assert rows[0]["model"] == "gemini-3-pro"
+    assert rows[0]["model"] == "gemini-2.5-pro"
     assert rows[0]["status"] == "succeeded"
 
 
@@ -1054,7 +1054,7 @@ async def test_cli_dispatch_raises_when_provider_config_missing(
             "stages": {
                 "final_compose": {
                     "provider": "gemini_cli",
-                    "model": "gemini-3-pro",
+                    "model": "gemini-2.5-pro",
                     "timeout_seconds": 300,
                 },
             },

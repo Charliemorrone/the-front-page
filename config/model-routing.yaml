@@ -9,8 +9,10 @@
 #   source_planning  → Qwen/Qwen3.6-35B-A3B
 #   relevance_filter → mlx-community/Qwen3.5-122B-A10B-4bit
 #   cluster_summary  → mlx-community/Qwen3.5-122B-A10B-4bit
-#   final_compose    → gemini_cli / gemini-3-pro (with vmlx Tier-2 fallback)
-#                      (2026-05-15 amendment: was openclaw/gpt-5.3-codex)
+#   final_compose    → gemini_cli / gemini-2.5-pro (with vmlx Tier-2 fallback)
+#                      (2026-05-15 amendment: was openclaw/gpt-5.3-codex;
+#                       2026-05-15 Step 12c correction: was gemini-3-pro,
+#                       which the live CLI v0.36.0 returns 404 on)
 #
 # As of 2026-05-06 the doc-target local flagships (Qwen3.5-122B-A10B-4bit,
 # ~70G; Qwen3.6-35B-A3B) are NOT on disk. Phase 1 substitutes models that
@@ -75,7 +77,11 @@ stages:
     # readability; the actual enforcement lives in the provider's
     # per-line idle + wall-clock checks.
     provider: gemini_cli
-    model: gemini-3-pro
+    # gemini-2.5-pro is Google's current Pro-subscription frontier model
+    # the CLI v0.36.0 routes to. The architecture doc's `gemini-3-pro`
+    # (named pre-Step-12c) returns 404 against this CLI version + Pro
+    # account — verified by the Step 12c live precheck (2026-05-15).
+    model: gemini-2.5-pro
     timeout_seconds: 300
     fallback:
       # Tier 2: local vMLX with the strongest cached model. The

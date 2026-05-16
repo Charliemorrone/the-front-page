@@ -2,7 +2,8 @@
 
 Architecture-doc Phase 5 requires final composition by a frontier-class
 model. The 2026-05-15 amendment routes that through the Gemini CLI
-(``gemini-3-pro`` by default) invoked as a subprocess rather than
+(``gemini-2.5-pro`` by default — see ``config/model-routing.yaml`` for
+the Step 12c correction note) invoked as a subprocess rather than
 through the OpenClaw WebSocket gateway. See
 ``docs/personal-intelligence-brief-architecture.md`` Decision 4
 amendment for the full rationale.
@@ -255,15 +256,28 @@ def _build_argv(
 def _extract_event_text(event: dict[str, Any]) -> str:
     """Pull text content out of one stream-json event.
 
-    Gemini CLI's stream-json schema isn't pinned by us — the live
-    smoke at 12c will confirm the exact shape. This helper is
-    permissive: it inspects the common field names that frontier-CLI
-    streams use (``text``, ``content``, ``delta``, and nested
-    ``message.content``). Unknown shapes yield empty string so the
-    caller treats them as a heartbeat/metadata event rather than
-    erroring.
+    Gemini CLI v0.36.0 (verified live, 2026-05-15) emits events shaped
+    like ``{"type": "message", "role": "<user|assistant>", "content":
+    "..."}`` alongside an ``init`` event and a final ``result`` event.
+    Critically, the CLI echoes the flattened user prompt back as a
+    ``role: "user"`` message **before** the assistant reply; treating
+    that echo as response content would prepend the entire prompt
+    (system instructions + cluster summaries) to the brief. So when
+    an event carries a ``role`` field, we only accept its content
+    when the role is ``assistant``. Events without a ``role`` field
+    fall through to the permissive multi-shape inspection so a
+    future CLI version that drops the role tag still works.
+
+    The helper inspects ``text``, ``content``, ``delta``, and nested
+    ``message.content`` in priority order. Unknown shapes yield
+    empty string so the caller treats them as a heartbeat/metadata
+    event rather than erroring.
     """
     if not isinstance(event, dict):
+        return ""
+    role = event.get("role")
+    if isinstance(role, str) and role.strip().lower() != "assistant":
+        # Filters the user-echo (and any future system-banner) events.
         return ""
     # Direct text fields, in priority order.
     for key in ("text", "content", "delta"):
@@ -282,16 +296,24 @@ def _extract_event_text(event: dict[str, Any]) -> str:
 def _extract_event_usage(event: dict[str, Any]) -> tuple[int, int] | None:
     """Pull (prompt_tokens, completion_tokens) out of a usage event.
 
-    Returns ``None`` when the event isn't a usage summary. Gemini-CLI
-    final events typically carry a ``usage`` dict with token counts;
-    we accept either flat ``prompt_tokens`` / ``completion_tokens``
-    keys or nested under ``usage``. Returns 0/0 (a tuple, not None)
-    for usage events with missing or non-integer values so the audit
-    row still distinguishes "received a usage event" from "didn't".
+    Returns ``None`` when the event isn't a usage summary. Gemini CLI
+    v0.36.0 emits its token counts as ``{"type": "result", "stats":
+    {"input_tokens": ..., "output_tokens": ...}}`` (verified live
+    2026-05-15); we also accept the more standard ``usage``-nested
+    shape and flat ``prompt_tokens`` / ``completion_tokens`` keys so
+    a future CLI emission shape doesn't silently drop accounting.
+    Returns 0/0 (a tuple, not None) for usage events with missing or
+    non-integer values so the audit row still distinguishes "received
+    a usage event" from "didn't".
     """
     if not isinstance(event, dict):
         return None
-    candidate = event.get("usage") if isinstance(event.get("usage"), dict) else None
+    candidate: dict[str, Any] | None = None
+    for key in ("usage", "stats"):
+        block = event.get(key)
+        if isinstance(block, dict):
+            candidate = block
+            break
     source = candidate if candidate is not None else event
     if not (
         "prompt_tokens" in source

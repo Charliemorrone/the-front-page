@@ -1405,7 +1405,7 @@ async def test_compose_tier1_gemini_cli_success_tag(
             "stages": {
                 "final_compose": {
                     "provider": "gemini_cli",
-                    "model": "gemini-3-pro",
+                    "model": "gemini-2.5-pro",
                     "timeout_seconds": 300,
                     "fallback": {"provider": "vmlx", "model": "fallback-vmlx"},
                 },
@@ -1426,11 +1426,11 @@ async def test_compose_tier1_gemini_cli_success_tag(
             coverage=Coverage(summarized_clusters=1),
             window_start="x",
             window_end="2026-05-15T00:00:00+00:00",
-            model="gemini-3-pro",
+            model="gemini-2.5-pro",
         )
 
     assert result.provider_tag == "gemini_cli"
-    assert result.model == "gemini-3-pro"
+    assert result.model == "gemini-2.5-pro"
     assert "Frontier prose" in result.markdown
 
 
@@ -1458,7 +1458,7 @@ async def test_compose_tier1_gemini_fail_tier2_vmlx_recovery(
             "stages": {
                 "final_compose": {
                     "provider": "gemini_cli",
-                    "model": "gemini-3-pro",
+                    "model": "gemini-2.5-pro",
                     "timeout_seconds": 300,
                     "fallback": {"provider": "vmlx", "model": "fallback-vmlx"},
                 },
@@ -1495,7 +1495,7 @@ async def test_compose_tier1_gemini_fail_tier2_vmlx_recovery(
             coverage=Coverage(summarized_clusters=1),
             window_start="x",
             window_end="2026-05-15T00:00:00+00:00",
-            model="gemini-3-pro",
+            model="gemini-2.5-pro",
         )
 
     assert result.provider_tag == "vmlx_fallback"

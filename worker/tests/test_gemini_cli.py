@@ -247,18 +247,18 @@ def test_flatten_messages_empty_list_raises() -> None:
 
 def test_build_argv_with_executable_path() -> None:
     cfg = _config(executable_path="/usr/bin/node", script_path="/bin/gemini")
-    argv = _build_argv(cfg, prompt="hi", model="gemini-3-pro")
+    argv = _build_argv(cfg, prompt="hi", model="gemini-2.5-pro")
     assert argv[0:2] == ["/usr/bin/node", "/bin/gemini"]
     assert "-p" in argv
     assert "hi" in argv
-    assert "-m" in argv and "gemini-3-pro" in argv
+    assert "-m" in argv and "gemini-2.5-pro" in argv
     assert "--approval-mode" in argv and "plan" in argv
     assert "-o" in argv and "stream-json" in argv
 
 
 def test_build_argv_without_executable_path_uses_script_only() -> None:
     cfg = _config(executable_path=None, script_path="/bin/gemini")
-    argv = _build_argv(cfg, prompt="hi", model="gemini-3-pro")
+    argv = _build_argv(cfg, prompt="hi", model="gemini-2.5-pro")
     assert argv[0] == "/bin/gemini"
     # No node binary prepended.
     assert argv[1] != "/bin/gemini"
@@ -308,6 +308,186 @@ def test_extract_event_usage_non_integer_returns_zero() -> None:
     assert out == (0, 0)
 
 
+# ── Live event-shape regression guards (Gemini CLI v0.36.0, 2026-05-15) ───────
+#
+# These tests pin the actual event shapes captured from a live
+# invocation against the operator's Gemini Pro account during Step 12c.
+# They are load-bearing because the original provider, written before
+# the live smoke, would have leaked the user-prompt echo into the
+# composed brief and silently lost usage accounting. See the Step 12c
+# build-log entry in docs/current-project-status.md for the captured
+# raw events used here.
+
+
+def test_extract_event_text_skips_user_role_echo() -> None:
+    """Load-bearing: Gemini CLI echoes the user prompt back as a
+    ``role: "user"`` message before the assistant reply. Treating
+    that as content would prepend the full prompt to the brief.
+    """
+    echo = {
+        "type": "message",
+        "timestamp": "2026-05-15T17:35:14.514Z",
+        "role": "user",
+        "content": "Reply with exactly: PONG\n",
+    }
+    assert _extract_event_text(echo) == ""
+
+
+def test_extract_event_text_accepts_assistant_role() -> None:
+    assistant = {
+        "type": "message",
+        "timestamp": "2026-05-15T17:35:18.414Z",
+        "role": "assistant",
+        "content": "PONG",
+        "delta": True,
+    }
+    assert _extract_event_text(assistant) == "PONG"
+
+
+def test_extract_event_text_omitted_role_falls_through() -> None:
+    """Back-compat: events without a ``role`` field still surface
+    content. The role guard only filters when role is explicitly set
+    to something non-assistant, so a future CLI emission that drops
+    the role tag still works.
+    """
+    assert _extract_event_text({"text": "hello", "type": "content"}) == "hello"
+
+
+def test_extract_event_text_init_event_is_empty() -> None:
+    """Gemini's init event carries metadata only — no content fields."""
+    init = {
+        "type": "init",
+        "timestamp": "2026-05-15T17:35:14.513Z",
+        "session_id": "d5d25e59-2b9f-4e5f-9628-f05507203889",
+        "model": "gemini-2.5-pro",
+    }
+    assert _extract_event_text(init) == ""
+
+
+def test_extract_event_text_result_event_is_empty() -> None:
+    """Gemini's final result event carries stats but no text content."""
+    result = {
+        "type": "result",
+        "timestamp": "2026-05-15T17:35:18.575Z",
+        "status": "success",
+        "stats": {"total_tokens": 6775, "input_tokens": 6683, "output_tokens": 2},
+    }
+    assert _extract_event_text(result) == ""
+
+
+def test_extract_event_text_skips_system_role() -> None:
+    """Defensive: any non-assistant role is filtered, not just user."""
+    sys_event = {"type": "message", "role": "system", "content": "you are an assistant"}
+    assert _extract_event_text(sys_event) == ""
+
+
+def test_extract_event_usage_from_stats_block() -> None:
+    """Load-bearing: Gemini CLI puts token counts under ``stats``,
+    not ``usage``. Without this fallback the audit log would record
+    0/0 for every Gemini call and the dashboard's per-call accounting
+    would be wrong.
+    """
+    out = _extract_event_usage({"stats": {"input_tokens": 6683, "output_tokens": 2}})
+    assert out == (6683, 2)
+
+
+def test_extract_event_usage_live_result_event_shape() -> None:
+    """Full captured shape from the 2026-05-15 live PONG probe."""
+    result = {
+        "type": "result",
+        "timestamp": "2026-05-15T17:35:18.575Z",
+        "status": "success",
+        "stats": {
+            "total_tokens": 6775,
+            "input_tokens": 6683,
+            "output_tokens": 2,
+            "cached": 0,
+            "input": 6683,
+            "duration_ms": 4062,
+            "tool_calls": 0,
+            "models": {
+                "gemini-2.5-pro": {
+                    "total_tokens": 6775,
+                    "input_tokens": 6683,
+                    "output_tokens": 2,
+                    "cached": 0,
+                    "input": 6683,
+                }
+            },
+        },
+    }
+    assert _extract_event_usage(result) == (6683, 2)
+
+
+def test_extract_event_usage_usage_block_still_preferred_when_present() -> None:
+    """``usage`` (the more standard shape) is tried before ``stats``."""
+    event = {
+        "usage": {"prompt_tokens": 100, "completion_tokens": 50},
+        "stats": {"input_tokens": 999, "output_tokens": 888},
+    }
+    assert _extract_event_usage(event) == (100, 50)
+
+
+def test_gemini_cli_completion_handles_live_v036_event_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end pin against the Gemini CLI v0.36.0 stream shape.
+
+    Replays the exact event sequence captured from a live PONG probe:
+    init → user-echo → assistant → result. The expected content is
+    just ``"PONG"`` (the assistant reply) — NOT the user-echo content,
+    which would otherwise leak the full prompt into the brief.
+    """
+    events = [
+        {
+            "type": "init",
+            "timestamp": "2026-05-15T17:35:14.513Z",
+            "session_id": "d5d25e59-2b9f-4e5f-9628-f05507203889",
+            "model": "gemini-2.5-pro",
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-05-15T17:35:14.514Z",
+            "role": "user",
+            "content": "Reply with exactly: PONG\n",
+        },
+        {
+            "type": "message",
+            "timestamp": "2026-05-15T17:35:18.414Z",
+            "role": "assistant",
+            "content": "PONG",
+            "delta": True,
+        },
+        {
+            "type": "result",
+            "timestamp": "2026-05-15T17:35:18.575Z",
+            "status": "success",
+            "stats": {
+                "total_tokens": 6775,
+                "input_tokens": 6683,
+                "output_tokens": 2,
+                "cached": 0,
+                "input": 6683,
+                "duration_ms": 4062,
+                "tool_calls": 0,
+            },
+        },
+    ]
+    proc = FakeProcess(stdout_lines=_events_to_lines(events), returncode=0)
+    _patch_exec(monkeypatch, lambda: proc)
+
+    result = asyncio.run(
+        gemini_cli_completion(_config(), messages=_messages(), model="gemini-2.5-pro")
+    )
+
+    # Load-bearing assertions: content is the assistant reply only,
+    # tokens come from the result event's stats block.
+    assert result.content == "PONG"
+    assert result.prompt_tokens == 6683
+    assert result.completion_tokens == 2
+    assert result.model == "gemini-2.5-pro"
+
+
 # ── Async happy path ──────────────────────────────────────────────────────────
 
 
@@ -322,11 +502,11 @@ def test_gemini_cli_completion_happy_path(monkeypatch: pytest.MonkeyPatch) -> No
     argvs = _patch_exec(monkeypatch, lambda: proc)
 
     cfg = _config()
-    result = asyncio.run(gemini_cli_completion(cfg, messages=_messages(), model="gemini-3-pro"))
+    result = asyncio.run(gemini_cli_completion(cfg, messages=_messages(), model="gemini-2.5-pro"))
 
     assert isinstance(result, GeminiCliResult)
     assert result.content == "# Daily Brief\n\n## Section\nbody."
-    assert result.model == "gemini-3-pro"
+    assert result.model == "gemini-2.5-pro"
     assert result.prompt_tokens == 1234
     assert result.completion_tokens == 567
     assert result.attempts == 1
@@ -341,11 +521,11 @@ def test_happy_path_uses_executable_path_and_passes_model(
     argvs = _patch_exec(monkeypatch, lambda: proc)
 
     cfg = _config(executable_path="/exec/node", script_path="/exec/gemini")
-    asyncio.run(gemini_cli_completion(cfg, messages=_messages(), model="gemini-3-pro"))
+    asyncio.run(gemini_cli_completion(cfg, messages=_messages(), model="gemini-2.5-pro"))
 
     argv = argvs[0]
     assert argv[:2] == ["/exec/node", "/exec/gemini"]
-    assert "gemini-3-pro" in argv
+    assert "gemini-2.5-pro" in argv
 
 
 def test_malformed_json_lines_treated_as_heartbeat(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -366,7 +546,7 @@ def test_malformed_json_lines_treated_as_heartbeat(monkeypatch: pytest.MonkeyPat
     _patch_exec(monkeypatch, lambda: proc)
 
     result = asyncio.run(
-        gemini_cli_completion(_config(), messages=_messages(), model="gemini-3-pro")
+        gemini_cli_completion(_config(), messages=_messages(), model="gemini-2.5-pro")
     )
     assert result.content == "good content more good content"
 
@@ -459,7 +639,7 @@ def test_non_zero_exit_raises_with_stderr_tail(monkeypatch: pytest.MonkeyPatch) 
     _patch_exec(monkeypatch, lambda: proc)
 
     with pytest.raises(GeminiCliExitError) as excinfo:
-        asyncio.run(gemini_cli_completion(_config(), messages=_messages(), model="gemini-3-pro"))
+        asyncio.run(gemini_cli_completion(_config(), messages=_messages(), model="gemini-2.5-pro"))
 
     err = excinfo.value
     assert err.returncode == 1
@@ -477,7 +657,7 @@ def test_empty_content_raises_output_error(monkeypatch: pytest.MonkeyPatch) -> N
     _patch_exec(monkeypatch, lambda: proc)
 
     with pytest.raises(GeminiCliOutputError, match="no text events"):
-        asyncio.run(gemini_cli_completion(_config(), messages=_messages(), model="gemini-3-pro"))
+        asyncio.run(gemini_cli_completion(_config(), messages=_messages(), model="gemini-2.5-pro"))
 
 
 # ── Retry behaviour ──────────────────────────────────────────────────────────
@@ -498,7 +678,7 @@ def test_retry_recovers_after_one_failure(monkeypatch: pytest.MonkeyPatch) -> No
 
     cfg = _config(retries=1, retry_backoff_seconds=0.0)
 
-    result = asyncio.run(gemini_cli_completion(cfg, messages=_messages(), model="gemini-3-pro"))
+    result = asyncio.run(gemini_cli_completion(cfg, messages=_messages(), model="gemini-2.5-pro"))
 
     assert result.content == "recovered content"
     assert result.attempts == 2

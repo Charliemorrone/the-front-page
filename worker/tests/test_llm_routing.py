@@ -256,13 +256,13 @@ def test_stage_routes_to_gemini_cli_provider(tmp_path: Path, base_config: dict[s
     }
     base_config["stages"]["final_compose"] = {
         "provider": "gemini_cli",
-        "model": "gemini-3-pro",
+        "model": "gemini-2.5-pro",
         "timeout_seconds": 300,
     }
     config = load_routing(_write_yaml(tmp_path / "routing.yaml", base_config))
     stage = config.resolve("final_compose")
     assert stage.provider == "gemini_cli"
-    assert stage.model == "gemini-3-pro"
+    assert stage.model == "gemini-2.5-pro"
 
 
 def test_stage_fallback_parses(tmp_path: Path, base_config: dict[str, Any]) -> None:
@@ -313,7 +313,7 @@ def test_stage_retries_field_optional_and_validated(
 ) -> None:
     base_config["stages"]["final_compose"] = {
         "provider": "gemini_cli",
-        "model": "gemini-3-pro",
+        "model": "gemini-2.5-pro",
         "timeout_seconds": 300,
         "retries": 2,
         "retry_backoff_seconds": 7.5,
@@ -344,7 +344,7 @@ def test_default_config_routes_final_compose_to_gemini_cli() -> None:
     config = load_routing()
     stage = config.resolve("final_compose")
     assert stage.provider == "gemini_cli"
-    assert stage.model == "gemini-3-pro"
+    assert stage.model == "gemini-2.5-pro"
     assert stage.fallback is not None
     assert stage.fallback.provider == "vmlx"
     assert config.providers.gemini_cli is not None
