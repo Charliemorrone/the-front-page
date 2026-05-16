@@ -64,6 +64,42 @@ class RelevanceBatchResponse(_SchemaBase):
     verdicts: list[RelevanceVerdict]
 
 
+class SearchPlan(_SchemaBase):
+    """Planner-recommended search strategy for one topic query (Phase 7b).
+
+    Field shape from the architecture doc's "Prompt Responsibilities →
+    Source Planner" section. The planner takes a query + the available
+    source kinds + the time window and returns this plan; the topic
+    orchestration layer (7e) dispatches fetchers per the plan.
+
+    All fields are permissive per the 9c lesson: local models reliably
+    emit empty arrays / ``null`` for narrative additions under load,
+    and an empty plan is itself a meaningful signal (downstream
+    coverage stays honest — "planner found no usable sources" produces
+    a 0-item brief, same shape as "fetchers all failed"). Strict
+    ``min_length=1`` here would force the bounded-repair retry on
+    every borderline case and still likely fail.
+
+    ``selected_source_kinds`` order IS the priority order — the first
+    kind is the planner's highest-priority dispatch target. This
+    matches the architecture-doc "Priority order" field without
+    bloating the schema with per-source priority integers.
+
+    Source-kind values are NOT constrained at the schema layer (no
+    ``Literal[...]``) — the caller sanity-checks against the actual
+    fetcher inventory at dispatch time. Constraining here would force a
+    schema bump every time a fetcher is added or renamed, which is the
+    wrong coupling.
+    """
+
+    selected_source_kinds: list[str] = Field(default_factory=list)
+    query_variants: list[str] = Field(default_factory=list)
+    required_terms: list[str] = Field(default_factory=list)
+    excluded_terms: list[str] = Field(default_factory=list)
+    expected_evidence_types: list[str] = Field(default_factory=list)
+    rationale: str = ""
+
+
 class ClusterSummaryPayload(_SchemaBase):
     """One cluster's grounded summary from the cluster-summary stage.
 
@@ -96,4 +132,5 @@ __all__ = (
     "ClusterSummaryPayload",
     "RelevanceBatchResponse",
     "RelevanceVerdict",
+    "SearchPlan",
 )

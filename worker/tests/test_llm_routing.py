@@ -348,3 +348,19 @@ def test_default_config_routes_final_compose_to_gemini_cli() -> None:
     assert stage.fallback is not None
     assert stage.fallback.provider == "vmlx"
     assert config.providers.gemini_cli is not None
+
+
+def test_default_config_declares_search_planning_stage() -> None:
+    """Phase 7b: the shipped default config declares a ``search_planning``
+    stage so the topic-query planner (Phase 7e wiring) can resolve it.
+    Pinning the presence + provider catches accidental removal.
+    """
+    config = load_routing()
+    stage = config.resolve("search_planning")
+    assert stage.provider == "vmlx"
+    # Model identifier deliberately not pinned — the Phase 7b placeholder
+    # (``Qwen3.5-27B-4bit``) gets swapped to the architecture-doc target
+    # (``Qwen/Qwen3.6-35B-A3B`` or fallback ``Qwen3.5-35B-A3B-4bit``)
+    # when the A3B MoE lands on disk; the routing config update is the
+    # operator concern, not a regression worth pinning.
+    assert stage.model.startswith("mlx-community/") or stage.model.startswith("Qwen/")

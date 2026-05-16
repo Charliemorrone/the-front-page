@@ -15,6 +15,7 @@ from clawfeed_intel.llm import (
     ClusterSummaryPayload,
     RelevanceBatchResponse,
     RelevanceVerdict,
+    SearchPlan,
 )
 
 
@@ -334,3 +335,95 @@ def test_summary_round_trip_via_json() -> None:
     assert parsed.headline == "Quiet release"
     assert parsed.confidence is None
     assert parsed.entities == ["acme/awesome"]
+
+
+# ── SearchPlan (Phase 7b) ─────────────────────────────────────────────────────
+
+
+def _valid_search_plan_payload() -> dict[str, object]:
+    return {
+        "selected_source_kinds": ["sec_edgar", "gdelt", "github_search"],
+        "query_variants": [
+            "Khosla Ventures",
+            "Vinod Khosla",
+            "Khosla led round",
+            "Khosla Ventures Form D",
+        ],
+        "required_terms": ["khosla"],
+        "excluded_terms": [],
+        "expected_evidence_types": ["funding_round", "regulatory_filing"],
+        "rationale": "Investor-focused query; prioritize filings + news + repo signals.",
+    }
+
+
+def test_search_plan_accepts_full_payload() -> None:
+    plan = SearchPlan.model_validate(_valid_search_plan_payload())
+    assert plan.selected_source_kinds == ["sec_edgar", "gdelt", "github_search"]
+    assert plan.query_variants[0] == "Khosla Ventures"
+    assert plan.required_terms == ["khosla"]
+    assert plan.expected_evidence_types == ["funding_round", "regulatory_filing"]
+
+
+def test_search_plan_accepts_empty_payload() -> None:
+    """Permissive per the 9c lesson — an empty plan is a meaningful
+    signal ("planner found no usable sources"), not a schema error.
+    Downstream the orchestrator surfaces it via coverage and produces
+    a 0-item brief, same shape as "fetchers all failed".
+    """
+    plan = SearchPlan.model_validate({})
+    assert plan.selected_source_kinds == []
+    assert plan.query_variants == []
+    assert plan.required_terms == []
+    assert plan.excluded_terms == []
+    assert plan.expected_evidence_types == []
+    assert plan.rationale == ""
+
+
+def test_search_plan_preserves_source_kind_order() -> None:
+    """``selected_source_kinds`` order IS the priority order — load-
+    bearing for the orchestrator's dispatch loop."""
+    payload = _valid_search_plan_payload()
+    payload["selected_source_kinds"] = ["github_search", "raw_cache", "hn_algolia"]
+    plan = SearchPlan.model_validate(payload)
+    assert plan.selected_source_kinds == ["github_search", "raw_cache", "hn_algolia"]
+
+
+def test_search_plan_rejects_extra_fields() -> None:
+    payload = _valid_search_plan_payload()
+    payload["priority_weights"] = {"sec_edgar": 1.0}  # hallucinated field
+    with pytest.raises(ValidationError):
+        SearchPlan.model_validate(payload)
+
+
+def test_search_plan_strips_string_whitespace() -> None:
+    payload = _valid_search_plan_payload()
+    payload["rationale"] = "  Trim me.  "
+    plan = SearchPlan.model_validate(payload)
+    assert plan.rationale == "Trim me."
+
+
+def test_search_plan_round_trip_via_json() -> None:
+    """The LLM client validates via ``model_validate_json`` — exercise that path."""
+    raw = (
+        '{"selected_source_kinds": ["gdelt", "reddit"], '
+        '"query_variants": ["Anthropic", "Claude AI"], '
+        '"required_terms": [], '
+        '"excluded_terms": ["cricket"], '
+        '"expected_evidence_types": ["news_article"], '
+        '"rationale": "AI company query; exclude unrelated cricket namesake."}'
+    )
+    plan = SearchPlan.model_validate_json(raw)
+    assert plan.selected_source_kinds == ["gdelt", "reddit"]
+    assert plan.excluded_terms == ["cricket"]
+
+
+def test_search_plan_does_not_constrain_source_kind_values() -> None:
+    """Schema deliberately does NOT use ``Literal[...]`` — caller
+    sanity-checks against the actual fetcher inventory. This test
+    pins that decision: a "future" or "unknown" kind passes schema
+    validation. Catching it is the dispatcher's job, not the schema's.
+    """
+    payload = _valid_search_plan_payload()
+    payload["selected_source_kinds"] = ["some_future_fetcher_kind"]
+    plan = SearchPlan.model_validate(payload)
+    assert plan.selected_source_kinds == ["some_future_fetcher_kind"]

@@ -65,6 +65,19 @@ stages:
     model: mlx-community/Qwen3-8B-4bit
     timeout_seconds: 90
 
+  search_planning:
+    # Phase 7b: topic-query source planner. Takes a query + the
+    # available source kinds and returns a `SearchPlan` (selected
+    # kinds in priority order, query variants, required/excluded
+    # terms, expected evidence types). Architecture-doc target is
+    # `Qwen/Qwen3.6-35B-A3B` (or `Qwen3.5-35B-A3B-4bit` as a fallback)
+    # — neither on disk yet. Phase 7b placeholder is the 27B-4bit
+    # that already serves filter + summary; swap is a YAML edit when
+    # the A3B MoE lands.
+    provider: vmlx
+    model: mlx-community/Qwen3.5-27B-4bit
+    timeout_seconds: 60
+
   relevance_filter:
     provider: vmlx
     model: mlx-community/Qwen3.5-27B-4bit

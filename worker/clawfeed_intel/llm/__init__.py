@@ -31,7 +31,12 @@ from .routing import (
     VmlxProviderConfig,
     load_routing,
 )
-from .schemas import ClusterSummaryPayload, RelevanceBatchResponse, RelevanceVerdict
+from .schemas import (
+    ClusterSummaryPayload,
+    RelevanceBatchResponse,
+    RelevanceVerdict,
+    SearchPlan,
+)
 
 __all__ = [
     "CallResult",
@@ -53,6 +58,7 @@ __all__ = [
     "RelevanceVerdict",
     "RetryConfig",
     "RoutingConfig",
+    "SearchPlan",
     "StageConfig",
     "VmlxProviderConfig",
     "gemini_cli_completion",
