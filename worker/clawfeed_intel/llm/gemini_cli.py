@@ -2,9 +2,9 @@
 
 Architecture-doc Phase 5 requires final composition by a frontier-class
 model. The 2026-05-15 amendment routes that through the Gemini CLI
-(``gemini-2.5-pro`` by default — see ``config/model-routing.yaml`` for
-the Step 12c correction note) invoked as a subprocess rather than
-through the OpenClaw WebSocket gateway. See
+(``gemini-3-pro-preview`` by default — see ``config/model-routing.yaml``
+for the Step 12c → 12d identifier evolution) invoked as a subprocess
+rather than through the OpenClaw WebSocket gateway. See
 ``docs/personal-intelligence-brief-architecture.md`` Decision 4
 amendment for the full rationale.
 

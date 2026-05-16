@@ -186,7 +186,7 @@ def _routing_with_gemini() -> RoutingConfig:
                 },
                 "final_compose": {
                     "provider": "gemini_cli",
-                    "model": "gemini-2.5-pro",
+                    "model": "gemini-3-pro-preview",
                     "timeout_seconds": 300,
                     "fallback": {"provider": "vmlx", "model": "stub-fallback"},
                 },
@@ -350,7 +350,7 @@ def test_dry_run_reports_final_compose_routing_with_fallback(
     _setup_dry_run_environment(monkeypatch, tmp_path)
     cli.cmd_run_daily(_dry_run_args())
     out = capsys.readouterr().out
-    assert "final_compose: gemini_cli/gemini-2.5-pro" in out
+    assert "final_compose: gemini_cli/gemini-3-pro-preview" in out
     assert "fallback to vmlx/stub-fallback" in out
 
 

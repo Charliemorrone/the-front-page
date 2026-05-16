@@ -247,18 +247,18 @@ def test_flatten_messages_empty_list_raises() -> None:
 
 def test_build_argv_with_executable_path() -> None:
     cfg = _config(executable_path="/usr/bin/node", script_path="/bin/gemini")
-    argv = _build_argv(cfg, prompt="hi", model="gemini-2.5-pro")
+    argv = _build_argv(cfg, prompt="hi", model="gemini-3-pro-preview")
     assert argv[0:2] == ["/usr/bin/node", "/bin/gemini"]
     assert "-p" in argv
     assert "hi" in argv
-    assert "-m" in argv and "gemini-2.5-pro" in argv
+    assert "-m" in argv and "gemini-3-pro-preview" in argv
     assert "--approval-mode" in argv and "plan" in argv
     assert "-o" in argv and "stream-json" in argv
 
 
 def test_build_argv_without_executable_path_uses_script_only() -> None:
     cfg = _config(executable_path=None, script_path="/bin/gemini")
-    argv = _build_argv(cfg, prompt="hi", model="gemini-2.5-pro")
+    argv = _build_argv(cfg, prompt="hi", model="gemini-3-pro-preview")
     assert argv[0] == "/bin/gemini"
     # No node binary prepended.
     assert argv[1] != "/bin/gemini"
@@ -359,7 +359,7 @@ def test_extract_event_text_init_event_is_empty() -> None:
         "type": "init",
         "timestamp": "2026-05-15T17:35:14.513Z",
         "session_id": "d5d25e59-2b9f-4e5f-9628-f05507203889",
-        "model": "gemini-2.5-pro",
+        "model": "gemini-3-pro-preview",
     }
     assert _extract_event_text(init) == ""
 
@@ -406,7 +406,7 @@ def test_extract_event_usage_live_result_event_shape() -> None:
             "duration_ms": 4062,
             "tool_calls": 0,
             "models": {
-                "gemini-2.5-pro": {
+                "gemini-3-pro-preview": {
                     "total_tokens": 6775,
                     "input_tokens": 6683,
                     "output_tokens": 2,
@@ -428,6 +428,77 @@ def test_extract_event_usage_usage_block_still_preferred_when_present() -> None:
     assert _extract_event_usage(event) == (100, 50)
 
 
+def test_gemini_cli_completion_handles_gemini_3_multi_assistant_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gemini 3 Pro Preview (verified live 2026-05-15) emits MULTIPLE
+    ``role: "assistant"`` events as the model generates, in contrast to
+    Gemini 2.5 Pro which buffered the whole response into one event.
+
+    The accumulator must concatenate per-event content. The user-echo
+    role filter still applies. The result event's ``stats.models`` block
+    reports the actual backing model (e.g. ``gemini-3.1-pro-preview``)
+    even when the request used the ``gemini-3-pro-preview`` alias —
+    surfaced via the captured fixture below.
+    """
+    events = [
+        {
+            "type": "init",
+            "session_id": "g3-fixture",
+            "model": "gemini-3-pro-preview",
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "content": "Write a single short haiku about a clean glass of water.\n",
+        },
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": "Crystal clear and cool,\nResting in a quiet glass,\n",
+            "delta": True,
+        },
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": "Pure refreshment waits.",
+            "delta": True,
+        },
+        {
+            "type": "result",
+            "status": "success",
+            "stats": {
+                "total_tokens": 8391,
+                "input_tokens": 8133,
+                "output_tokens": 18,
+                "duration_ms": 4358,
+                "models": {
+                    "gemini-3.1-pro-preview": {
+                        "total_tokens": 8391,
+                        "input_tokens": 8133,
+                        "output_tokens": 18,
+                    }
+                },
+            },
+        },
+    ]
+    proc = FakeProcess(stdout_lines=_events_to_lines(events), returncode=0)
+    _patch_exec(monkeypatch, lambda: proc)
+
+    result = asyncio.run(
+        gemini_cli_completion(_config(), messages=_messages(), model="gemini-3-pro-preview")
+    )
+
+    # Load-bearing: chunks are concatenated in order; user-echo doesn't
+    # leak; tokens come from the result event's stats.
+    assert result.content == (
+        "Crystal clear and cool,\nResting in a quiet glass,\nPure refreshment waits."
+    )
+    assert result.prompt_tokens == 8133
+    assert result.completion_tokens == 18
+    assert result.model == "gemini-3-pro-preview"
+
+
 def test_gemini_cli_completion_handles_live_v036_event_stream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -443,7 +514,7 @@ def test_gemini_cli_completion_handles_live_v036_event_stream(
             "type": "init",
             "timestamp": "2026-05-15T17:35:14.513Z",
             "session_id": "d5d25e59-2b9f-4e5f-9628-f05507203889",
-            "model": "gemini-2.5-pro",
+            "model": "gemini-3-pro-preview",
         },
         {
             "type": "message",
@@ -477,7 +548,7 @@ def test_gemini_cli_completion_handles_live_v036_event_stream(
     _patch_exec(monkeypatch, lambda: proc)
 
     result = asyncio.run(
-        gemini_cli_completion(_config(), messages=_messages(), model="gemini-2.5-pro")
+        gemini_cli_completion(_config(), messages=_messages(), model="gemini-3-pro-preview")
     )
 
     # Load-bearing assertions: content is the assistant reply only,
@@ -485,7 +556,7 @@ def test_gemini_cli_completion_handles_live_v036_event_stream(
     assert result.content == "PONG"
     assert result.prompt_tokens == 6683
     assert result.completion_tokens == 2
-    assert result.model == "gemini-2.5-pro"
+    assert result.model == "gemini-3-pro-preview"
 
 
 # ── Async happy path ──────────────────────────────────────────────────────────
@@ -502,11 +573,13 @@ def test_gemini_cli_completion_happy_path(monkeypatch: pytest.MonkeyPatch) -> No
     argvs = _patch_exec(monkeypatch, lambda: proc)
 
     cfg = _config()
-    result = asyncio.run(gemini_cli_completion(cfg, messages=_messages(), model="gemini-2.5-pro"))
+    result = asyncio.run(
+        gemini_cli_completion(cfg, messages=_messages(), model="gemini-3-pro-preview")
+    )
 
     assert isinstance(result, GeminiCliResult)
     assert result.content == "# Daily Brief\n\n## Section\nbody."
-    assert result.model == "gemini-2.5-pro"
+    assert result.model == "gemini-3-pro-preview"
     assert result.prompt_tokens == 1234
     assert result.completion_tokens == 567
     assert result.attempts == 1
@@ -521,11 +594,11 @@ def test_happy_path_uses_executable_path_and_passes_model(
     argvs = _patch_exec(monkeypatch, lambda: proc)
 
     cfg = _config(executable_path="/exec/node", script_path="/exec/gemini")
-    asyncio.run(gemini_cli_completion(cfg, messages=_messages(), model="gemini-2.5-pro"))
+    asyncio.run(gemini_cli_completion(cfg, messages=_messages(), model="gemini-3-pro-preview"))
 
     argv = argvs[0]
     assert argv[:2] == ["/exec/node", "/exec/gemini"]
-    assert "gemini-2.5-pro" in argv
+    assert "gemini-3-pro-preview" in argv
 
 
 def test_malformed_json_lines_treated_as_heartbeat(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -546,7 +619,7 @@ def test_malformed_json_lines_treated_as_heartbeat(monkeypatch: pytest.MonkeyPat
     _patch_exec(monkeypatch, lambda: proc)
 
     result = asyncio.run(
-        gemini_cli_completion(_config(), messages=_messages(), model="gemini-2.5-pro")
+        gemini_cli_completion(_config(), messages=_messages(), model="gemini-3-pro-preview")
     )
     assert result.content == "good content more good content"
 
@@ -639,7 +712,9 @@ def test_non_zero_exit_raises_with_stderr_tail(monkeypatch: pytest.MonkeyPatch) 
     _patch_exec(monkeypatch, lambda: proc)
 
     with pytest.raises(GeminiCliExitError) as excinfo:
-        asyncio.run(gemini_cli_completion(_config(), messages=_messages(), model="gemini-2.5-pro"))
+        asyncio.run(
+            gemini_cli_completion(_config(), messages=_messages(), model="gemini-3-pro-preview")
+        )
 
     err = excinfo.value
     assert err.returncode == 1
@@ -657,7 +732,9 @@ def test_empty_content_raises_output_error(monkeypatch: pytest.MonkeyPatch) -> N
     _patch_exec(monkeypatch, lambda: proc)
 
     with pytest.raises(GeminiCliOutputError, match="no text events"):
-        asyncio.run(gemini_cli_completion(_config(), messages=_messages(), model="gemini-2.5-pro"))
+        asyncio.run(
+            gemini_cli_completion(_config(), messages=_messages(), model="gemini-3-pro-preview")
+        )
 
 
 # ── Retry behaviour ──────────────────────────────────────────────────────────
@@ -678,7 +755,9 @@ def test_retry_recovers_after_one_failure(monkeypatch: pytest.MonkeyPatch) -> No
 
     cfg = _config(retries=1, retry_backoff_seconds=0.0)
 
-    result = asyncio.run(gemini_cli_completion(cfg, messages=_messages(), model="gemini-2.5-pro"))
+    result = asyncio.run(
+        gemini_cli_completion(cfg, messages=_messages(), model="gemini-3-pro-preview")
+    )
 
     assert result.content == "recovered content"
     assert result.attempts == 2

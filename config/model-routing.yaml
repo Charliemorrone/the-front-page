@@ -9,10 +9,16 @@
 #   source_planning  → Qwen/Qwen3.6-35B-A3B
 #   relevance_filter → mlx-community/Qwen3.5-122B-A10B-4bit
 #   cluster_summary  → mlx-community/Qwen3.5-122B-A10B-4bit
-#   final_compose    → gemini_cli / gemini-2.5-pro (with vmlx Tier-2 fallback)
+#   final_compose    → gemini_cli / gemini-3-pro-preview (with vmlx Tier-2 fallback)
 #                      (2026-05-15 amendment: was openclaw/gpt-5.3-codex;
 #                       2026-05-15 Step 12c correction: was gemini-3-pro,
-#                       which the live CLI v0.36.0 returns 404 on)
+#                       which the live CLI v0.36.0 returns 404 on;
+#                       2026-05-15 Step 12d upgrade: gemini-3-pro-preview
+#                       confirmed reachable — currently aliases to
+#                       gemini-3.1-pro-preview server-side. The unqualified
+#                       gemini-3-pro identifier still 404s; this is the
+#                       canonical Gemini-3 entry point on the operator's
+#                       Pro subscription.)
 #
 # As of 2026-05-06 the doc-target local flagships (Qwen3.5-122B-A10B-4bit,
 # ~70G; Qwen3.6-35B-A3B) are NOT on disk. Phase 1 substitutes models that
@@ -77,11 +83,14 @@ stages:
     # readability; the actual enforcement lives in the provider's
     # per-line idle + wall-clock checks.
     provider: gemini_cli
-    # gemini-2.5-pro is Google's current Pro-subscription frontier model
-    # the CLI v0.36.0 routes to. The architecture doc's `gemini-3-pro`
-    # (named pre-Step-12c) returns 404 against this CLI version + Pro
-    # account — verified by the Step 12c live precheck (2026-05-15).
-    model: gemini-2.5-pro
+    # gemini-3-pro-preview is Google's current Pro-subscription
+    # entry point for Gemini 3 Pro. Aliases to gemini-3.1-pro-preview
+    # server-side (the `models` block in the result event reports this).
+    # The unqualified `gemini-3-pro` returns 404 against CLI v0.36.0 +
+    # the operator's Pro account — verified by the Step 12d live
+    # precheck (2026-05-15). gemini-2.5-pro is the documented fallback
+    # if the preview tier is revoked.
+    model: gemini-3-pro-preview
     timeout_seconds: 300
     fallback:
       # Tier 2: local vMLX with the strongest cached model. The
