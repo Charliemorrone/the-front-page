@@ -84,12 +84,19 @@ class RunMetadata:
     Mirrors the JSON example in
     ``docs/personal-intelligence-brief-architecture.md`` ("Daily brief
     digests.metadata example").
+
+    ``query`` is populated for ``brief_kind='topic'`` runs (Phase 7) and
+    left ``None`` for daily runs. Stamped onto the digest metadata so a
+    consumer reading historical topic briefs can recover what the
+    operator was asking about without round-tripping through the
+    ``intel_runs`` table.
     """
 
     brief_kind: str
     run_id: int
     window_start: str
     window_end: str
+    query: str | None = None
     composition_provider: str | None = None
     composition_model: str | None = None
     local_models: dict[str, str] = field(default_factory=dict)

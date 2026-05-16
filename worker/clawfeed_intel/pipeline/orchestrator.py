@@ -19,7 +19,7 @@ from .. import db
 from ..fetchers import run_fetch_stage
 from ..llm import LLMClient, RoutingConfig, load_routing
 from ..runs import RunMetadata
-from ..sources import build_source_plan
+from ..sources import ProfileConfig, SourcePlan, build_source_plan
 from ..timewindow import window_for
 from .cluster import cluster_run
 from .compose import compose_brief
@@ -40,6 +40,41 @@ def run_daily(window_spec: str, *, conn: sqlite3.Connection | None = None) -> in
         conn = db.connect()
     try:
         return _execute_daily(conn, window_spec)
+    finally:
+        if owns_conn:
+            conn.close()
+
+
+def run_topic(
+    query: str,
+    *,
+    window_days: int = 30,
+    conn: sqlite3.Connection | None = None,
+) -> int:
+    """Execute one topic-search run end-to-end. Returns the published digest id.
+
+    Phase 7a scaffold: the search-planner (7b) and topic-specific
+    fetchers (7c) are not wired yet, so this drives the full lifecycle
+    against an empty :class:`SourcePlan`. The result is a published
+    digest stamped ``metadata.brief_kind='topic'`` and
+    ``metadata.query=<query>`` whose content is the deterministic
+    empty-brief stub — confirming the lifecycle + DB shape + compose
+    parameterization work end-to-end. Subsequent 7b–7e commits replace
+    the empty SourcePlan with planner-driven source selection and
+    topic-flavored prompts.
+
+    Daily-run path is unchanged: the only shared surface is
+    :func:`_drive_run`, which now accepts an optional pre-built
+    ``SourcePlan`` and threads ``brief_kind`` + ``query`` through to
+    :func:`compose_brief`.
+    """
+    if not query or not query.strip():
+        raise ValueError("query must not be empty or whitespace-only")
+    owns_conn = conn is None
+    if owns_conn:
+        conn = db.connect()
+    try:
+        return _execute_topic(conn, query.strip(), window_days=window_days)
     finally:
         if owns_conn:
             conn.close()
@@ -74,10 +109,61 @@ def _execute_daily(conn: sqlite3.Connection, window_spec: str) -> int:
         raise
 
 
-def _drive_run(conn: sqlite3.Connection, run_id: int, metadata: RunMetadata) -> int:
+def _execute_topic(conn: sqlite3.Connection, query: str, *, window_days: int) -> int:
+    window_spec = f"{window_days}d"
+    window_start, window_end = window_for(window_spec)
+    log.info("creating topic run query=%r window=%s..%s", query, window_start, window_end)
+    run_id = db.create_run(
+        conn,
+        run_type="topic",
+        window_start=window_start,
+        window_end=window_end,
+        query=query,
+    )
+    log.info("run %d: created (pending, topic)", run_id)
+
+    metadata = RunMetadata(
+        brief_kind="topic",
+        run_id=run_id,
+        window_start=window_start,
+        window_end=window_end,
+        query=query,
+    )
+
+    # Empty SourcePlan stub for 7a. Phase 7b's search planner will
+    # replace this with a query-driven plan; 7c registers the
+    # topic-specific fetchers (hn_algolia, raw_cache). The empty plan
+    # walks the lifecycle honestly: 0 fetches → 0 raw items → 0
+    # clusters → 0 kept → 0 summarized → render_empty_brief.
+    plan = SourcePlan(
+        profile=ProfileConfig(),
+        categories=[],
+        dynamic_search=[],
+        warnings=[],
+    )
+
+    try:
+        return _drive_run(conn, run_id, metadata, plan=plan)
+    except Exception as exc:
+        log.exception("run %d: failed during execution", run_id)
+        try:
+            db.finish_run(conn, run_id, status="failed", error=str(exc))
+        except Exception:
+            log.exception("run %d: failed-state update also failed", run_id)
+        raise
+
+
+def _drive_run(
+    conn: sqlite3.Connection,
+    run_id: int,
+    metadata: RunMetadata,
+    *,
+    plan: SourcePlan | None = None,
+) -> int:
     db.mark_run_started(conn, run_id)
     log.info("run %d: → fetching", run_id)
-    plan = build_source_plan(conn)
+    if plan is None:
+        plan = build_source_plan(conn)
     log.info(
         "run %d: source plan resolved (%d categories, %d warnings)",
         run_id,
@@ -145,6 +231,8 @@ def _drive_run(conn: sqlite3.Connection, run_id: int, metadata: RunMetadata) -> 
             window_start=metadata.window_start,
             window_end=metadata.window_end,
             model=compose_stage_config.model,
+            brief_kind=metadata.brief_kind,
+            query=metadata.query,
         )
     )
     metadata.composition_provider = compose_result.provider_tag
@@ -157,6 +245,11 @@ def _drive_run(conn: sqlite3.Connection, run_id: int, metadata: RunMetadata) -> 
     )
 
     db.update_run_metadata(conn, run_id, metadata.as_json())
+    # Topic briefs piggyback on digests.type='daily' per the
+    # architecture-doc workaround (see "ClawFeed's Current Digest Type
+    # Schema Is Too Narrow"); metadata.brief_kind is the truth-source
+    # for which kind of brief the digest holds. Relaxing the schema is
+    # a separate Node-side concern (Phase 7g or later).
     digest_id = db.create_digest(
         conn,
         digest_type="daily",
@@ -164,7 +257,9 @@ def _drive_run(conn: sqlite3.Connection, run_id: int, metadata: RunMetadata) -> 
         metadata=metadata.as_json(),
     )
     db.finish_run(conn, run_id, status="published", digest_id=digest_id)
-    log.info("run %d: → published (digest=%d)", run_id, digest_id)
+    log.info(
+        "run %d: → published (digest=%d, brief_kind=%s)", run_id, digest_id, metadata.brief_kind
+    )
     return digest_id
 
 

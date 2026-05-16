@@ -493,6 +493,47 @@ def test_empty_brief_renders_coverage_only() -> None:
     assert normalize_compose_output(out) == out.strip()
 
 
+def test_empty_brief_topic_kind_uses_topic_h1() -> None:
+    """Phase 7a: brief_kind='topic' + query swaps the H1 line to
+    ``# Topic Brief: <query> — <date>`` while keeping the rest of the
+    structure identical (Executive Read + Coverage)."""
+    out = render_empty_brief(
+        coverage=_coverage(),
+        window_start="2026-04-15T00:00:00+00:00",
+        window_end="2026-05-15T00:00:00+00:00",
+        run_id=99,
+        brief_kind="topic",
+        query="Khosla Ventures",
+    )
+    assert out.startswith("# Topic Brief: Khosla Ventures — 2026-05-15")
+    assert "Daily Intelligence Brief" not in out
+    assert "## Executive Read" in out
+    assert "## Coverage" in out
+
+
+def test_empty_brief_topic_kind_strips_whitespace_in_h1() -> None:
+    """Blank/whitespace query falls through to the daily-shaped H1 so
+    the brief stays publishable even if the caller hands us garbage."""
+    out_blank = render_empty_brief(
+        coverage=_coverage(),
+        window_start="x",
+        window_end="2026-05-15T00:00:00+00:00",
+        run_id=1,
+        brief_kind="topic",
+        query="   ",
+    )
+    assert out_blank.startswith("# Daily Intelligence Brief — 2026-05-15")
+    out_padded = render_empty_brief(
+        coverage=_coverage(),
+        window_start="x",
+        window_end="2026-05-15T00:00:00+00:00",
+        run_id=1,
+        brief_kind="topic",
+        query="  Anthropic  ",
+    )
+    assert out_padded.startswith("# Topic Brief: Anthropic — 2026-05-15")
+
+
 # ── render_fallback_brief ─────────────────────────────────────────────────────
 
 

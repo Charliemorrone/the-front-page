@@ -390,6 +390,8 @@ def render_empty_brief(
     window_start: str,
     window_end: str,
     run_id: int,
+    brief_kind: str = "daily",
+    query: str | None = None,
 ) -> str:
     """Render a deterministic 'no items today' brief without an LLM call.
 
@@ -399,9 +401,15 @@ def render_empty_brief(
     would waste tokens; emitting nothing would lose the coverage
     audit trail. The architecture-doc rule "always publish a useful
     brief" is satisfied by a coverage-only document.
+
+    ``brief_kind`` parameterizes the H1 line: ``"daily"`` produces
+    ``"# Daily Intelligence Brief — <date>"``; ``"topic"`` produces
+    ``"# Topic Brief: <query> — <date>"``. The empty-brief shape is
+    identical otherwise — the topic-flavored prompt + section layout
+    lands in Phase 7e once we have real items to compose with.
     """
     lines: list[str] = [
-        f"# Daily Intelligence Brief — {window_end[:10]}",
+        _render_brief_h1(brief_kind=brief_kind, query=query, window_end=window_end),
         "",
         "## Executive Read",
         "",
@@ -442,6 +450,8 @@ def render_fallback_brief(
     window_end: str,
     run_id: int,
     failure_reason: str,
+    brief_kind: str = "daily",
+    query: str | None = None,
 ) -> str:
     """Render a degraded brief directly from cluster summaries (no LLM call).
 
@@ -453,10 +463,14 @@ def render_fallback_brief(
     deterministic Markdown brief built from the structured
     ``item_summaries`` rows — less polished than an LLM-composed
     brief, but still grounded and citation-preserving.
+
+    ``brief_kind`` + ``query`` parameterize the H1 line the same way
+    :func:`render_empty_brief` does.
     """
     grouped = _group_by_category(items, plan_categories)
+    h1 = _render_brief_h1(brief_kind=brief_kind, query=query, window_end=window_end)
     lines: list[str] = [
-        f"# Daily Intelligence Brief — {window_end[:10]} (degraded)",
+        f"{h1} (degraded)",
         "",
         "_Final composition failed; this brief was rendered directly "
         "from the structured cluster summaries without prose synthesis. "
@@ -506,6 +520,22 @@ def render_fallback_brief(
         lines.append(f"- Failed summary clusters: {coverage.failed_summary_clusters}")
     lines.extend(["", f"_Run id: {run_id}._"])
     return "\n".join(lines) + "\n"
+
+
+def _render_brief_h1(*, brief_kind: str, query: str | None, window_end: str) -> str:
+    """Build the H1 line for the deterministic brief paths.
+
+    Daily briefs are date-keyed; topic briefs lead with the query so
+    the operator can scan a list of past topic runs without opening
+    each one. The window-end date trails the topic title so the brief
+    is still time-attributable. Empty / whitespace-only query falls
+    through to the date-only form to keep the brief publishable even
+    if the CLI somehow handed us a blank query string.
+    """
+    date = window_end[:10]
+    if brief_kind == "topic" and query and query.strip():
+        return f"# Topic Brief: {query.strip()} — {date}"
+    return f"# Daily Intelligence Brief — {date}"
 
 
 def _humanize_category(slug: str) -> str:
@@ -567,6 +597,8 @@ async def compose_brief(
     window_end: str,
     model: str,
     prompt_version: str = PROMPT_VERSION,
+    brief_kind: str = "daily",
+    query: str | None = None,
 ) -> ComposeResult:
     """Produce one Markdown daily brief for *run_id*.
 
@@ -602,6 +634,8 @@ async def compose_brief(
             window_start=window_start,
             window_end=window_end,
             run_id=run_id,
+            brief_kind=brief_kind,
+            query=query,
         )
         return ComposeResult(markdown=markdown, provider_tag="local_stub_empty", model=model)
 
@@ -679,6 +713,8 @@ async def compose_brief(
         window_end=window_end,
         run_id=run_id,
         failure_reason=failure_reason,
+        brief_kind=brief_kind,
+        query=query,
     )
     return ComposeResult(
         markdown=markdown,

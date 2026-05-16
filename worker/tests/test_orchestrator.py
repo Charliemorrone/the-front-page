@@ -547,3 +547,131 @@ def test_run_daily_marks_failure_on_db_error(temp_db, monkeypatch, tmp_path):
         assert rows[0]["finished_at"] is not None
         assert "simulated stage failure" in (rows[0]["error"] or "")
         assert rows[0]["digest_id"] is None
+
+
+# ── Phase 7a: topic-run lifecycle ──────────────────────────────────────────────
+
+
+def test_run_topic_publishes_empty_brief_stub(temp_db, monkeypatch, tmp_path):
+    """Phase 7a scaffold: a topic run walks the full lifecycle with an
+    empty :class:`SourcePlan` (no planner, no topic fetchers yet) and
+    publishes a digest stamped ``brief_kind='topic'`` + ``query=<text>``.
+    The brief content is the deterministic empty-brief stub since 0
+    items reached compose.
+    """
+    from clawfeed_intel.pipeline.orchestrator import run_topic
+
+    _isolate_config(monkeypatch, tmp_path)
+    _stub_llm_client(monkeypatch)
+
+    with closing(worker_db.connect(temp_db)) as conn:
+        digest_id = run_topic("Khosla Ventures", window_days=30, conn=conn)
+
+        digest = conn.execute("SELECT * FROM digests WHERE id = ?", (digest_id,)).fetchone()
+        assert digest is not None
+        # Architecture-doc workaround: topic briefs piggyback on
+        # digests.type='daily' until the schema CHECK is relaxed.
+        # metadata.brief_kind is the truth-source for the brief type.
+        assert digest["type"] == "daily"
+        assert "Topic Brief: Khosla Ventures" in digest["content"]
+
+        meta = json.loads(digest["metadata"])
+        assert meta["brief_kind"] == "topic"
+        assert meta["query"] == "Khosla Ventures"
+        assert meta["run_id"] > 0
+        assert meta["window_start"].endswith("+00:00")
+        assert meta["window_end"].endswith("+00:00")
+        # Empty plan + no fetchers → compose routes to render_empty_brief.
+        assert meta["composition_provider"] == "local_stub_empty"
+        assert meta["coverage"]["sources_attempted"] == 0
+        assert meta["coverage"]["raw_items"] == 0
+        assert meta["coverage"]["clusters"] == 0
+        assert meta["coverage"]["kept_clusters"] == 0
+        assert meta["coverage"]["summarized_clusters"] == 0
+
+        runs = conn.execute("SELECT * FROM intel_runs WHERE digest_id = ?", (digest_id,)).fetchall()
+        assert len(runs) == 1
+        run = runs[0]
+        assert run["status"] == "published"
+        assert run["run_type"] == "topic"
+        assert run["query"] == "Khosla Ventures"
+        assert run["started_at"] is not None
+        assert run["finished_at"] is not None
+        assert run["error"] is None
+
+
+def test_run_topic_strips_query_whitespace(temp_db, monkeypatch, tmp_path):
+    """A query with surrounding whitespace is trimmed before persistence
+    so identical conceptual queries dedupe on the storage layer and
+    the brief H1 doesn't carry leading/trailing space."""
+    from clawfeed_intel.pipeline.orchestrator import run_topic
+
+    _isolate_config(monkeypatch, tmp_path)
+    _stub_llm_client(monkeypatch)
+
+    with closing(worker_db.connect(temp_db)) as conn:
+        digest_id = run_topic("  Anthropic funding  ", window_days=14, conn=conn)
+        digest = conn.execute("SELECT * FROM digests WHERE id = ?", (digest_id,)).fetchone()
+        meta = json.loads(digest["metadata"])
+        assert meta["query"] == "Anthropic funding"
+        assert "Topic Brief: Anthropic funding" in digest["content"]
+
+
+def test_run_topic_empty_query_rejected(temp_db):
+    """Empty or whitespace-only queries fail loudly at the boundary
+    rather than producing a topic brief with no topic."""
+    from clawfeed_intel.pipeline.orchestrator import run_topic
+
+    with closing(worker_db.connect(temp_db)) as conn:
+        with pytest.raises(ValueError, match="query must not be empty"):
+            run_topic("", conn=conn)
+        with pytest.raises(ValueError, match="query must not be empty"):
+            run_topic("   ", conn=conn)
+        # No row should have been created on the rejected calls.
+        assert conn.execute("SELECT COUNT(*) FROM intel_runs").fetchone()[0] == 0
+
+
+def test_run_topic_does_not_affect_daily_path(temp_db, monkeypatch, tmp_path):
+    """Phase 7a contract (architecture-doc Phase 7 gate): topic runs
+    must not affect the daily-run path. A topic run followed by a
+    daily run should produce two independent digests; the daily
+    digest is shaped exactly like the existing daily test.
+    """
+    from clawfeed_intel.pipeline.orchestrator import run_topic
+
+    _isolate_config(monkeypatch, tmp_path)
+    _stub_llm_client(monkeypatch)
+
+    with closing(worker_db.connect(temp_db)) as conn:
+        topic_id = run_topic("Anthropic", conn=conn)
+        daily_id = run_daily("24h", conn=conn)
+
+        assert topic_id != daily_id
+
+        topic = conn.execute("SELECT * FROM digests WHERE id = ?", (topic_id,)).fetchone()
+        daily = conn.execute("SELECT * FROM digests WHERE id = ?", (daily_id,)).fetchone()
+        topic_meta = json.loads(topic["metadata"])
+        daily_meta = json.loads(daily["metadata"])
+
+        # Critical: the daily brief is shaped exactly as before — no
+        # query field surfaced, brief_kind='daily', H1 doesn't carry a
+        # topic title.
+        assert daily_meta["brief_kind"] == "daily"
+        assert daily_meta["query"] is None
+        assert "Daily Intelligence Brief" in daily["content"]
+        assert "Topic Brief:" not in daily["content"]
+
+        # And the topic brief is the topic brief.
+        assert topic_meta["brief_kind"] == "topic"
+        assert topic_meta["query"] == "Anthropic"
+        assert "Topic Brief: Anthropic" in topic["content"]
+
+        # intel_runs rows are independent — different run_types,
+        # different queries, both terminal at 'published'.
+        rows = conn.execute(
+            "SELECT id, run_type, query, status FROM intel_runs ORDER BY id"
+        ).fetchall()
+        assert len(rows) == 2
+        run_types = {r["run_type"] for r in rows}
+        assert run_types == {"daily", "topic"}
+        assert all(r["status"] == "published" for r in rows)

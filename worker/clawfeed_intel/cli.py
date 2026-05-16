@@ -1,8 +1,9 @@
 """ClawFeed Intelligence CLI.
 
-Phase 1 + Phase 6 surface:
+Phase 1 + Phase 6 + Phase 7 surface:
     clawfeed-intel doctor              health-check vMLX, DB
     clawfeed-intel run daily           run a daily brief (24h window)
+    clawfeed-intel run topic --query   run a topic-search brief (Phase 7)
     clawfeed-intel cleanup             prune old raw_items + llm_calls
     clawfeed-intel cron install        install the 06:15 launchd job
     clawfeed-intel cron uninstall      remove the launchd job
@@ -32,7 +33,7 @@ from pathlib import Path
 from . import __version__, db, doctor, launchagent
 from .llm import load_routing
 from .paths import DB_PATH, REPO_ROOT
-from .pipeline.orchestrator import run_daily
+from .pipeline.orchestrator import run_daily, run_topic
 from .sources import build_source_plan
 
 log = logging.getLogger(__name__)
@@ -167,6 +168,58 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     print(f"published digest {digest_id}")
+    return 0
+
+
+def cmd_run_topic(args: argparse.Namespace) -> int:
+    """Execute a topic-search run end-to-end.
+
+    Phase 7a scaffold: the search-planner stage (7b) and topic-specific
+    fetchers (7c) are not wired yet, so the resulting brief will be the
+    deterministic empty-brief stub stamped with ``brief_kind='topic'``
+    and the supplied query. This is the spine that 7b–7e fill in.
+
+    Preflight matches the daily-run posture: vMLX must be reachable
+    and the routing config must parse. Topic runs don't strictly need
+    the LLM until 7b lands, but enforcing the preflight now means the
+    behavior + exit codes stay consistent once the planner is wired.
+    """
+    if not args.query or not args.query.strip():
+        print("error: --query must not be empty", file=sys.stderr)
+        return 2
+
+    try:
+        routing = load_routing()
+    except Exception as exc:
+        print(
+            f"preflight: routing config failed to load: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return 3
+    try:
+        results = asyncio.run(doctor.run_doctor_probes(routing))
+    except Exception as exc:
+        print(
+            f"preflight: probes raised unexpectedly: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return 3
+    if any(not r.ok for r in results):
+        print("preflight: vMLX is not ready — aborting before run", file=sys.stderr)
+        for r in results:
+            marker = " ok " if r.ok else "FAIL"
+            print(
+                f"    [{marker}] {r.name:24s} {r.latency_ms:>5d}ms — {r.detail}",
+                file=sys.stderr,
+            )
+        return 3
+
+    try:
+        digest_id = run_topic(args.query, window_days=args.window_days)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(f"published topic digest {digest_id}")
     return 0
 
 
@@ -477,6 +530,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    topic = run_sub.add_parser(
+        "topic",
+        help="run a topic-search brief for the supplied query (Phase 7)",
+    )
+    topic.add_argument(
+        "--query",
+        required=True,
+        help='search query, e.g. --query "Khosla Ventures"',
+    )
+    topic.add_argument(
+        "--window-days",
+        type=int,
+        default=30,
+        help="lookback window in days (default: 30, per architecture-doc Phase-7 example)",
+    )
+
     cleanup = sub.add_parser(
         "cleanup",
         help="prune old raw_items and llm_calls per retention policy",
@@ -545,6 +614,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_doctor(args)
     if args.cmd == "run" and args.run_type == "daily":
         return cmd_run_daily(args)
+    if args.cmd == "run" and args.run_type == "topic":
+        return cmd_run_topic(args)
     if args.cmd == "cleanup":
         return cmd_cleanup(args)
     if args.cmd == "cron":
